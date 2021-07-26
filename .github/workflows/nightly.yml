@@ -149,6 +149,14 @@ jobs:
           echo "GOPATH=${{ github.workspace }}" >> $GITHUB_ENV
           echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
 
+      - name: Build arm64
+        env:
+          GOOS: windows
+          GOARCH: arm64
+        run: |
+          make binaries
+          move bin bin_winarm64
+
       - name: Build amd64
         env:
           GOOS: windows
@@ -161,3 +169,9 @@ jobs:
         with:
           name: windows_amd64
           path: src/github.com/containerd/containerd/bin/
+
+      - name: Upload artifacts (windows_arm64)
+        uses: actions/upload-artifact@v1
+        with:
+          name: windows_arm64
+          path: src/github.com/containerd/containerd/bin_winarm64/
