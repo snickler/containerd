@@ -1,6 +1,6 @@
 # Prepare windows environment for building and running containerd tests
 
-$PACKAGES= @{ mingw = ""; git = ""; golang = "1.17.0-rc1"; make = "" }
+$PACKAGES= @{ mingw = ""; git = ""; golang = "1.17rc1"; make = "" }
 
 write-host "Downloading chocolatey package"
 curl.exe -L "https://packages.chocolatey.org/chocolatey.0.10.15.nupkg" -o 'c:\choco.zip'
