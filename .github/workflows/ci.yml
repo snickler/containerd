@@ -22,7 +22,7 @@ jobs:
 
     strategy:
       matrix:
-        go-version: [1.16.6]
+        go-version: [1.17.0-rc1]
         os: [ubuntu-18.04, macos-10.15, windows-2019]
 
     steps:
@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.16.6'
+          go-version: '1.17.0-rc1'
 
       - shell: bash
         run: |
@@ -84,7 +84,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.16.6'
+          go-version: '1.17.0-rc1'
 
       - uses: actions/checkout@v2
         with:
@@ -117,7 +117,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.16.6'
+          go-version: '1.17.0-rc1'
 
       - name: Set env
         shell: bash
@@ -159,11 +159,13 @@ jobs:
           - goos: windows
             goarch: arm
             goarm: "7"
+          - goos: windows
+            goarch: arm64
 
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.16.6'
+          go-version: '1.17.0-rc1'
       - name: Set env
         shell: bash
         run: |
@@ -200,6 +202,9 @@ jobs:
           windows/arm/v7)
             echo "CGO_ENABLED=0" >> $GITHUB_ENV
             ;;
+          windows/arm64)
+            echo "CGO_ENABLED=0" >> $GITHUB_ENV
+            ;;
           esac
 
           if [ -n "${packages}" ]; then
@@ -228,7 +233,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-18.04, macos-10.15, windows-2019]
-        go-version: ['1.16.6']
+        go-version: ['1.17.0-rc1']
         include:
           # Go 1.13.x is still used by Docker/Moby
           - go-version: '1.13.x'
@@ -274,7 +279,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.16.6'
+          go-version: '1.17.0-rc1'
 
       - uses: actions/checkout@v2
         with:
@@ -355,7 +360,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.16.6'
+          go-version: '1.17.0-rc1'
 
       - uses: actions/checkout@v2
         with:
@@ -498,7 +503,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.16.6'
+          go-version: '1.17.0-rc1'
 
       - uses: actions/checkout@v2
         with:
