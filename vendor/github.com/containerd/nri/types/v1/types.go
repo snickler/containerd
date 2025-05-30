@@ -18,8 +18,7 @@ package v1
 
 import (
 	"encoding/json"
-
-	"github.com/pkg/errors"
+	"errors"
 )
 
 // Plugin type and configuration
@@ -34,7 +33,7 @@ type Plugin struct {
 //
 // Normally located at /etc/nri/conf.json
 type ConfigList struct {
-	// Verion of the list
+	// Version of the list
 	Version string `json:"version"`
 	// Plugins
 	Plugins []*Plugin `json:"plugins"`

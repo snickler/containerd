@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
    Copyright The containerd Authors.
@@ -22,8 +22,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -54,4 +55,16 @@ func withExecExitStatus(s *specs.Process, es int) {
 
 func withExecArgs(s *specs.Process, args ...string) {
 	s.Args = args
+}
+
+func newDirectIO(ctx context.Context, terminal bool) (*directIO, error) {
+	fifos, err := cio.NewFIFOSetInDir("", "", terminal)
+	if err != nil {
+		return nil, err
+	}
+	dio, err := cio.NewDirectIO(ctx, fifos)
+	if err != nil {
+		return nil, err
+	}
+	return &directIO{DirectIO: *dio}, nil
 }

@@ -17,9 +17,9 @@
 package command
 
 import (
-	gocontext "context"
+	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -27,17 +27,16 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/services/server"
-	srvconfig "github.com/containerd/containerd/services/server/config"
-	"github.com/containerd/containerd/sys"
-	"github.com/containerd/containerd/version"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/containerd/containerd/v2/cmd/containerd/server"
+	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
+	_ "github.com/containerd/containerd/v2/core/metrics" // import containerd build info
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/sys"
+	"github.com/containerd/containerd/v2/version"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/urfave/cli/v2"
 	"google.golang.org/grpc/grpclog"
 )
 
@@ -53,10 +52,20 @@ high performance container runtime
 
 func init() {
 	// Discard grpc logs so that they don't mess with our stdio
-	grpclog.SetLoggerV2(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
 
-	cli.VersionPrinter = func(c *cli.Context) {
-		fmt.Println(c.App.Name, version.Package, c.App.Version, version.Revision)
+	cli.VersionPrinter = func(cliContext *cli.Context) {
+		fmt.Println(cliContext.App.Name, version.Package, cliContext.App.Version, version.Revision)
+	}
+	cli.VersionFlag = &cli.BoolFlag{
+		Name:    "version",
+		Aliases: []string{"v"},
+		Usage:   "Print the version",
+	}
+	cli.HelpFlag = &cli.BoolFlag{
+		Name:    "help",
+		Aliases: []string{"h"},
+		Usage:   "Show help",
 	}
 }
 
@@ -68,7 +77,7 @@ func App() *cli.App {
 	app.Usage = usage
 	app.Description = `
 containerd is a high performance container runtime whose daemon can be started
-by using this command. If none of the *config*, *publish*, or *help* commands
+by using this command. If none of the *config*, *publish*, *oci-hook*, or *help* commands
 are specified, the default action of the **containerd** command is to start the
 containerd daemon in the foreground.
 
@@ -78,56 +87,71 @@ at the default file location. The *containerd config* command can be used to
 generate the default configuration for containerd. The output of that command
 can be used and modified as necessary as a custom configuration.`
 	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:  "config,c",
-			Usage: "path to the configuration file",
-			Value: filepath.Join(defaults.DefaultConfigDir, "config.toml"),
+		&cli.StringFlag{
+			Name:    "config",
+			Aliases: []string{"c"},
+			Usage:   "Path to the configuration file",
+			Value:   filepath.Join(defaults.DefaultConfigDir, "config.toml"),
 		},
-		cli.StringFlag{
-			Name:  "log-level,l",
-			Usage: "set the logging level [trace, debug, info, warn, error, fatal, panic]",
+		&cli.StringFlag{
+			Name:    "log-level",
+			Aliases: []string{"l"},
+			Usage:   "Set the logging level [trace, debug, info, warn, error, fatal, panic]",
 		},
-		cli.StringFlag{
-			Name:  "address,a",
-			Usage: "address for containerd's GRPC server",
+		&cli.StringFlag{
+			Name:    "address",
+			Aliases: []string{"a"},
+			Usage:   "Address for containerd's GRPC server",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "root",
 			Usage: "containerd root directory",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "state",
 			Usage: "containerd state directory",
 		},
 	}
 	app.Flags = append(app.Flags, serviceFlags()...)
-	app.Commands = []cli.Command{
+	app.Commands = []*cli.Command{
 		configCommand,
 		publishCommand,
 		ociHook,
 	}
-	app.Action = func(context *cli.Context) error {
+	app.Action = func(cliContext *cli.Context) error {
 		var (
-			start   = time.Now()
-			signals = make(chan os.Signal, 2048)
-			serverC = make(chan *server.Server, 1)
-			ctx     = gocontext.Background()
-			config  = defaultConfig()
+			start       = time.Now()
+			signals     = make(chan os.Signal, 2048)
+			serverC     = make(chan *server.Server, 1)
+			ctx, cancel = context.WithCancel(cliContext.Context)
+			config      = defaultConfig()
 		)
+
+		defer cancel()
 
 		// Only try to load the config if it either exists, or the user explicitly
 		// told us to load this path.
-		configPath := context.GlobalString("config")
+		configPath := cliContext.String("config")
 		_, err := os.Stat(configPath)
-		if !os.IsNotExist(err) || context.GlobalIsSet("config") {
-			if err := srvconfig.LoadConfig(configPath, config); err != nil {
+		if !os.IsNotExist(err) || cliContext.IsSet("config") {
+			if err := srvconfig.LoadConfig(ctx, configPath, config); err != nil {
 				return err
 			}
 		}
 
 		// Apply flags to the config
-		if err := applyFlags(context, config); err != nil {
+		if err := applyFlags(cliContext, config); err != nil {
 			return err
+		}
+
+		if config.GRPC.Address == "" {
+			return fmt.Errorf("grpc address cannot be empty: %w", errdefs.ErrInvalidArgument)
+		}
+		if config.TTRPC.Address == "" {
+			// If TTRPC was not explicitly configured, use defaults based on GRPC.
+			config.TTRPC.Address = config.GRPC.Address + ".ttrpc"
+			config.TTRPC.UID = config.GRPC.UID
+			config.TTRPC.GID = config.GRPC.GID
 		}
 
 		// Make sure top-level directories are created early.
@@ -138,20 +162,20 @@ can be used and modified as necessary as a custom configuration.`
 		// Stop if we are registering or unregistering against Windows SCM.
 		stop, err := registerUnregisterService(config.Root)
 		if err != nil {
-			logrus.Fatal(err)
+			log.L.Fatal(err)
 		}
 		if stop {
 			return nil
 		}
 
-		done := handleSignals(ctx, signals, serverC)
+		done := handleSignals(ctx, signals, serverC, cancel)
 		// start the signal handler as soon as we can to make sure that
 		// we don't miss any signals during boot
 		signal.Notify(signals, handledSignals...)
 
 		// cleanup temp mounts
 		if err := mount.SetTempMountLocation(filepath.Join(config.Root, "tmpmounts")); err != nil {
-			return errors.Wrap(err, "creating temp mount location")
+			return fmt.Errorf("creating temp mount location: %w", err)
 		}
 		// unmount all temp mounts on boot for the server
 		warnings, err := mount.CleanupTempMounts(0)
@@ -162,41 +186,71 @@ can be used and modified as necessary as a custom configuration.`
 			log.G(ctx).WithError(w).Warn("cleanup temp mount")
 		}
 
-		if config.GRPC.Address == "" {
-			return errors.Wrap(errdefs.ErrInvalidArgument, "grpc address cannot be empty")
-		}
-		if config.TTRPC.Address == "" {
-			// If TTRPC was not explicitly configured, use defaults based on GRPC.
-			config.TTRPC.Address = fmt.Sprintf("%s.ttrpc", config.GRPC.Address)
-			config.TTRPC.UID = config.GRPC.UID
-			config.TTRPC.GID = config.GRPC.GID
-		}
-		log.G(ctx).WithFields(logrus.Fields{
+		log.G(ctx).WithFields(log.Fields{
 			"version":  version.Version,
 			"revision": version.Revision,
 		}).Info("starting containerd")
 
-		server, err := server.New(ctx, config)
-		if err != nil {
-			return err
+		type srvResp struct {
+			s   *server.Server
+			err error
 		}
 
-		// Launch as a Windows Service if necessary
-		if err := launchService(server, done); err != nil {
-			logrus.Fatal(err)
+		// run server initialization in a goroutine so we don't end up blocking important things like SIGTERM handling
+		// while the server is initializing.
+		// As an example, opening the bolt database blocks forever if a containerd instance
+		// is already running, which must then be forcibly terminated (SIGKILL) to recover.
+		chsrv := make(chan srvResp)
+		go func() {
+			defer close(chsrv)
+
+			server, err := server.New(ctx, config)
+			if err != nil {
+				select {
+				case chsrv <- srvResp{err: err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+
+			// Launch as a Windows Service if necessary
+			if err := launchService(server, done); err != nil {
+				log.L.Fatal(err)
+			}
+			select {
+			case <-ctx.Done():
+				server.Stop()
+			case chsrv <- srvResp{s: server}:
+			}
+		}()
+
+		var server *server.Server
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case r := <-chsrv:
+			if r.err != nil {
+				return r.err
+			}
+			server = r.s
 		}
 
-		serverC <- server
+		// We don't send the server down serverC directly in the goroutine above because we need it lower down.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case serverC <- server:
+		}
 
 		if config.Debug.Address != "" {
 			var l net.Listener
 			if isLocalAddress(config.Debug.Address) {
 				if l, err = sys.GetLocalListener(config.Debug.Address, config.Debug.UID, config.Debug.GID); err != nil {
-					return errors.Wrapf(err, "failed to get listener for debug endpoint")
+					return fmt.Errorf("failed to get listener for debug endpoint: %w", err)
 				}
 			} else {
 				if l, err = net.Listen("tcp", config.Debug.Address); err != nil {
-					return errors.Wrapf(err, "failed to get listener for debug endpoint")
+					return fmt.Errorf("failed to get listener for debug endpoint: %w", err)
 				}
 			}
 			serve(ctx, l, server.ServeDebug)
@@ -204,43 +258,52 @@ can be used and modified as necessary as a custom configuration.`
 		if config.Metrics.Address != "" {
 			l, err := net.Listen("tcp", config.Metrics.Address)
 			if err != nil {
-				return errors.Wrapf(err, "failed to get listener for metrics endpoint")
+				return fmt.Errorf("failed to get listener for metrics endpoint: %w", err)
 			}
 			serve(ctx, l, server.ServeMetrics)
 		}
 		// setup the ttrpc endpoint
 		tl, err := sys.GetLocalListener(config.TTRPC.Address, config.TTRPC.UID, config.TTRPC.GID)
 		if err != nil {
-			return errors.Wrapf(err, "failed to get listener for main ttrpc endpoint")
+			return fmt.Errorf("failed to get listener for main ttrpc endpoint: %w", err)
 		}
 		serve(ctx, tl, server.ServeTTRPC)
 
 		if config.GRPC.TCPAddress != "" {
 			l, err := net.Listen("tcp", config.GRPC.TCPAddress)
 			if err != nil {
-				return errors.Wrapf(err, "failed to get listener for TCP grpc endpoint")
+				return fmt.Errorf("failed to get listener for TCP grpc endpoint: %w", err)
 			}
 			serve(ctx, l, server.ServeTCP)
 		}
 		// setup the main grpc endpoint
 		l, err := sys.GetLocalListener(config.GRPC.Address, config.GRPC.UID, config.GRPC.GID)
 		if err != nil {
-			return errors.Wrapf(err, "failed to get listener for main endpoint")
+			return fmt.Errorf("failed to get listener for main endpoint: %w", err)
 		}
 		serve(ctx, l, server.ServeGRPC)
 
-		if err := notifyReady(ctx); err != nil {
-			log.G(ctx).WithError(err).Warn("notify ready failed")
-		}
+		readyC := make(chan struct{})
+		go func() {
+			server.Wait()
+			close(readyC)
+		}()
 
-		log.G(ctx).Infof("containerd successfully booted in %fs", time.Since(start).Seconds())
-		<-done
+		select {
+		case <-readyC:
+			if err := notifyReady(ctx); err != nil {
+				log.G(ctx).WithError(err).Warn("notify ready failed")
+			}
+			log.G(ctx).Infof("containerd successfully booted in %fs", time.Since(start).Seconds())
+			<-done
+		case <-done:
+		}
 		return nil
 	}
 	return app
 }
 
-func serve(ctx gocontext.Context, l net.Listener, serveFunc func(net.Listener) error) {
+func serve(ctx context.Context, l net.Listener, serveFunc func(net.Listener) error) {
 	path := l.Addr().String()
 	log.G(ctx).WithField("address", path).Info("serving...")
 	go func() {
@@ -251,15 +314,16 @@ func serve(ctx gocontext.Context, l net.Listener, serveFunc func(net.Listener) e
 	}()
 }
 
-func applyFlags(context *cli.Context, config *srvconfig.Config) error {
+func applyFlags(cliContext *cli.Context, config *srvconfig.Config) error {
 	// the order for config vs flag values is that flags will always override
 	// the config values if they are set
-	if err := setLogLevel(context, config); err != nil {
+	if err := setLogLevel(cliContext, config); err != nil {
 		return err
 	}
 	if err := setLogFormat(config); err != nil {
 		return err
 	}
+
 	for _, v := range []struct {
 		name string
 		d    *string
@@ -277,52 +341,41 @@ func applyFlags(context *cli.Context, config *srvconfig.Config) error {
 			d:    &config.GRPC.Address,
 		},
 	} {
-		if s := context.GlobalString(v.name); s != "" {
+		if s := cliContext.String(v.name); s != "" {
 			*v.d = s
+			if v.name == "root" || v.name == "state" {
+				absPath, err := filepath.Abs(s)
+				if err != nil {
+					return err
+				}
+				*v.d = absPath
+			}
 		}
 	}
 
-	applyPlatformFlags(context)
+	applyPlatformFlags(cliContext)
 
 	return nil
 }
 
-func setLogLevel(context *cli.Context, config *srvconfig.Config) error {
-	l := context.GlobalString("log-level")
+func setLogLevel(cliContext *cli.Context, config *srvconfig.Config) error {
+	l := cliContext.String("log-level")
 	if l == "" {
 		l = config.Debug.Level
 	}
 	if l != "" {
-		lvl, err := logrus.ParseLevel(l)
-		if err != nil {
-			return err
-		}
-		logrus.SetLevel(lvl)
+		return log.SetLevel(l)
 	}
 	return nil
 }
 
 func setLogFormat(config *srvconfig.Config) error {
-	f := config.Debug.Format
+	f := log.OutputFormat(config.Debug.Format)
 	if f == "" {
 		f = log.TextFormat
 	}
 
-	switch f {
-	case log.TextFormat:
-		logrus.SetFormatter(&logrus.TextFormatter{
-			TimestampFormat: log.RFC3339NanoFixed,
-			FullTimestamp:   true,
-		})
-	case log.JSONFormat:
-		logrus.SetFormatter(&logrus.JSONFormatter{
-			TimestampFormat: log.RFC3339NanoFixed,
-		})
-	default:
-		return errors.Errorf("unknown log format: %s", f)
-	}
-
-	return nil
+	return log.SetFormat(f)
 }
 
 func dumpStacks(writeToFile bool) {
@@ -337,7 +390,7 @@ func dumpStacks(writeToFile bool) {
 		bufferLen *= 2
 	}
 	buf = buf[:stackSize]
-	logrus.Infof("=== BEGIN goroutine stack dump ===\n%s\n=== END goroutine stack dump ===", buf)
+	log.L.Infof("=== BEGIN goroutine stack dump ===\n%s\n=== END goroutine stack dump ===", buf)
 
 	if writeToFile {
 		// Also write to file to aid gathering diagnostics
@@ -348,6 +401,6 @@ func dumpStacks(writeToFile bool) {
 		}
 		defer f.Close()
 		f.WriteString(string(buf))
-		logrus.Infof("goroutine stack dump written to %s", name)
+		log.L.Infof("goroutine stack dump written to %s", name)
 	}
 }

@@ -1,28 +1,30 @@
 name: Nightly
 on:
   schedule:
-    - cron: '0 0 * * *' # Every day at midnight
+    - cron: "0 0 * * *" # Every day at midnight
   pull_request:
     paths:
-      - '.github/workflows/nightly.yml'
+      - ".github/workflows/nightly.yml"
+
+permissions: # added using https://github.com/step-security/secure-workflows
+  contents: read
 
 jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     defaults:
       run:
         working-directory: src/github.com/containerd/containerd
 
     steps:
-      - uses: actions/setup-go@v2
-        with:
-          go-version: '1.16.6'
-
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: src/github.com/containerd/containerd
+
+      - uses: ./src/github.com/containerd/containerd/.github/actions/install-go
 
       - name: Set env
         shell: bash
@@ -36,27 +38,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo add-apt-repository "deb [arch=arm64,s390x,ppc64el] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc) main" || true
-          sudo add-apt-repository "deb [arch=arm64,s390x,ppc64el] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc)-updates main" || true
-
-          sudo dpkg --add-architecture arm64
-          sudo dpkg --add-architecture s390x
-          sudo dpkg --add-architecture ppc64el
-
           sudo apt-get update || true
 
           sudo apt-get install -y \
             crossbuild-essential-arm64 \
             crossbuild-essential-s390x \
             crossbuild-essential-ppc64el \
-            libseccomp-dev:amd64 \
-            libseccomp-dev:arm64 \
-            libseccomp-dev:s390x \
-            libseccomp-dev:ppc64el \
-            libbtrfs-dev:amd64 \
-            libbtrfs-dev:arm64 \
-            libbtrfs-dev:s390x \
-            libbtrfs-dev:ppc64el
+            crossbuild-essential-riscv64 \
 
       - name: Build amd64
         env:
@@ -96,50 +84,65 @@ jobs:
           make binaries
           mv bin bin_ppc64le
 
+      - name: Build riscv64
+        env:
+          GOOS: linux
+          GOARCH: riscv64
+          CGO_ENABLED: 1
+          CC: riscv64-linux-gnu-gcc
+        run: |
+          make binaries
+          mv bin bin_riscv64
+
       #
       # Upload
       #
 
       - name: Upload artifacts (linux_amd64)
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux_amd64
           path: src/github.com/containerd/containerd/bin_amd64
 
       - name: Upload artifacts (linux_arm64)
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux_arm64
           path: src/github.com/containerd/containerd/bin_arm64
 
       - name: Upload artifacts (linux_s390x)
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux_s390x
           path: src/github.com/containerd/containerd/bin_s390x
 
       - name: Upload artifacts (linux_ppc64le)
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux_ppc64le
           path: src/github.com/containerd/containerd/bin_ppc64le
 
+      - name: Upload artifacts (linux_riscv64)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux_riscv64
+          path: src/github.com/containerd/containerd/bin_riscv64
+
   windows:
     name: Windows
     runs-on: windows-latest
+    timeout-minutes: 30
 
     defaults:
       run:
         working-directory: src/github.com/containerd/containerd
 
     steps:
-      - uses: actions/setup-go@v2
-        with:
-          go-version: '1.16.6'
-
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: src/github.com/containerd/containerd
+
+      - uses: ./src/github.com/containerd/containerd/.github/actions/install-go
 
       - name: Set env
         shell: bash
@@ -155,7 +158,7 @@ jobs:
           make binaries
 
       - name: Upload artifacts (windows_amd64)
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows_amd64
           path: src/github.com/containerd/containerd/bin/

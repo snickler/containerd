@@ -104,6 +104,17 @@ if [ -f "${CONTAINERD_HOME}/${CONTAINERD_ENV_METADATA}" ]; then
   source "${CONTAINERD_HOME}/${CONTAINERD_ENV_METADATA}"
 fi
 
+set +x
+# GCS_BUCKET_TOKEN_METADATA is the metadata key for the GCS bucket token
+GCS_BUCKET_TOKEN_METADATA="GCS_BUCKET_TOKEN"
+# GCS_BUCKET_TOKEN should have read access to the bucket from which
+# containerd artifacts need to be downloaded
+GCS_BUCKET_TOKEN=$(fetch_metadata "${GCS_BUCKET_TOKEN_METADATA}")
+if [[ -n "${GCS_BUCKET_TOKEN}" ]]; then
+  HEADERS=(-H "Authorization: Bearer ${GCS_BUCKET_TOKEN}")
+fi
+set -x
+
 # CONTAINERD_PKG_PREFIX is the prefix of the cri-containerd tarball name.
 # By default use the release tarball with cni built in.
 pkg_prefix=${CONTAINERD_PKG_PREFIX:-"cri-containerd-cni"}
@@ -114,7 +125,7 @@ if [ "${CONTAINERD_TEST:-"false"}"  != "true" ]; then
   # CONTAINERD_VERSION is the cri-containerd version to use.
   version=${CONTAINERD_VERSION:-""}
 else
-  deploy_path=${CONTAINERD_DEPLOY_PATH:-"cri-containerd-staging"}
+  deploy_path=${CONTAINERD_DEPLOY_PATH:-"k8s-staging-cri-tools"}
 
   # PULL_REFS_METADATA is the metadata key of PULL_REFS from prow.
   PULL_REFS_METADATA="PULL_REFS"
@@ -126,8 +137,16 @@ else
 
   # TODO(random-liu): Put version into the metadata instead of
   # deciding it in cloud init. This may cause issue to reboot test.
-  version=$(curl -f --ipv4 --retry 6 --retry-delay 3 --silent --show-error \
-    https://storage.googleapis.com/${deploy_path}/latest)
+  if [ $(uname -m) == "aarch64" ]; then
+    version=$(curl -f --ipv4 --retry 6 --retry-delay 3 --silent --show-error \
+      -H "Accept: application/vnd.github.v3+json" \
+      "https://api.github.com/repos/containerd/containerd/releases/latest" \
+      | jq -r .tag_name \
+      | sed "s:v::g")
+  else
+    version=$(set +x; curl -X GET "${HEADERS[@]}" -f --ipv4 --retry 6 --retry-delay 3 --silent --show-error \
+      https://storage.googleapis.com/${deploy_path}/latest)
+  fi
 fi
 
 TARBALL_GCS_NAME="${pkg_prefix}-${version}.linux-amd64.tar.gz"
@@ -148,11 +167,17 @@ if [ -z "${version}" ]; then
     exit 1
   fi
 else
-  if is_preloaded "${TARBALL_GCS_NAME}" "${tar_sha1}"; then
+  if [ $(uname -m) == "aarch64" ]; then
+    curl -f --ipv4 -Lo "${TARBALL}" --connect-timeout 20 --max-time 300 --retry 6 --retry-delay 10 \
+	"https://github.com/containerd/containerd/releases/download/v${version}/cri-containerd-${version}-linux-arm64.tar.gz"
+    tar xvf "${TARBALL}"
+    rm -f "${TARBALL}"
+  elif is_preloaded "${TARBALL_GCS_NAME}" "${tar_sha1}"; then
     echo "${TARBALL_GCS_NAME} is preloaded"
   else
     # Download and untar the release tar ball.
-    curl -f --ipv4 -Lo "${TARBALL}" --connect-timeout 20 --max-time 300 --retry 6 --retry-delay 10 "${TARBALL_GCS_PATH}"
+    $(set +x; curl -X GET "${HEADERS[@]}" -f --ipv4 -Lo "${TARBALL}" --connect-timeout 20 --max-time 300 --retry 6 \
+      --retry-delay 10 "${TARBALL_GCS_PATH}")
     tar xvf "${TARBALL}"
     rm -f "${TARBALL}"
   fi
@@ -165,6 +190,7 @@ rm -f "${CONTAINERD_HOME}/etc/crictl.yaml"
 
 # Generate containerd config
 config_path="${CONTAINERD_CONFIG_PATH:-"/etc/containerd/config.toml"}"
+registry_config_path="${CONTAINERD_REGISTRY_CONFIG_PATH:-"/etc/containerd/certs.d"}"
 mkdir -p $(dirname ${config_path})
 cni_bin_dir="${CONTAINERD_HOME}/opt/cni/bin"
 cni_template_path="${CONTAINERD_HOME}/opt/containerd/cluster/gce/cni.template"
@@ -176,8 +202,8 @@ if [ "${KUBERNETES_MASTER:-}" != "true" ]; then
     cni_template_path=""
   fi
 fi
-# Use systemd cgroup if cgroupv2 is enabled
-systemdCgroup="${CONTAINERD_CGROUPV2:-"false"}"
+# Use systemd cgroup if specified in env
+systemdCgroup="${CONTAINERD_SYSTEMD_CGROUP:-"false"}"
 log_level="${CONTAINERD_LOG_LEVEL:-"info"}"
 max_container_log_line="${CONTAINERD_MAX_CONTAINER_LOG_LINE:-16384}"
 cat > ${config_path} <<EOF
@@ -198,24 +224,36 @@ disabled_plugins = ["io.containerd.internal.v1.restart"]
   bin_dir = "${cni_bin_dir}"
   conf_dir = "/etc/cni/net.d"
   conf_template = "${cni_template_path}"
-[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-  endpoint = ["https://mirror.gcr.io","https://registry-1.docker.io"]
+[plugins."io.containerd.grpc.v1.cri".registry]
+  config_path = "${registry_config_path}"
 [plugins."io.containerd.grpc.v1.cri".containerd]
   default_runtime_name = "${CONTAINERD_DEFAULT_RUNTIME:-"runc"}"
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
   runtime_type = "io.containerd.runc.v2"
+  runtime_path = "${CONTAINERD_HOME}/usr/local/bin/containerd-shim-runc-v2"
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
   BinaryName = "${CONTAINERD_HOME}/usr/local/sbin/runc"
   SystemdCgroup = ${systemdCgroup}
 EOF
 chmod 644 "${config_path}"
 
+
+docker_registry_host_namespace="${registry_config_path}/docker.io/hosts.toml"
+mkdir -p $(dirname ${docker_registry_host_namespace})
+cat > ${docker_registry_host_namespace} <<EOF
+server = "https://registry-1.docker.io"
+
+[host."https://mirror.gcr.io"]
+  capabilities = ["pull", "resolve"]
+EOF
+chmod 644 "${docker_registry_host_namespace}"
+
 # containerd_extra_runtime_handler is the extra runtime handler to install.
 containerd_extra_runtime_handler=${CONTAINERD_EXTRA_RUNTIME_HANDLER:-""}
 if [[ -n "${containerd_extra_runtime_handler}" ]]; then
   cat >> ${config_path} <<EOF
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.${containerd_extra_runtime_handler}]
-  runtime_type = "${CONTAINERD_EXTRA_RUNTIME_TYPE:-io.containerd.runc.v1}"
+  runtime_type = "${CONTAINERD_EXTRA_RUNTIME_TYPE:-io.containerd.runc.v2}"
 
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.${containerd_extra_runtime_handler}.options]
 ${CONTAINERD_EXTRA_RUNTIME_OPTIONS:-}

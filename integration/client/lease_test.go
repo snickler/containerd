@@ -20,18 +20,15 @@ import (
 	"runtime"
 	"testing"
 
-	. "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/leases"
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
+	imagelist "github.com/containerd/containerd/v2/integration/images"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/image-spec/identity"
 )
 
 func TestLeaseResources(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip()
-	}
-
 	ctx, cancel := testContext(t)
 	defer cancel()
 
@@ -41,11 +38,15 @@ func TestLeaseResources(t *testing.T) {
 	}
 	defer client.Close()
 
+	snapshotterName := "native"
+	if runtime.GOOS == "windows" {
+		snapshotterName = "windows"
+	}
 	var (
 		ls     = client.LeasesService()
 		cs     = client.ContentStore()
 		imgSrv = client.ImageService()
-		sn     = client.SnapshotService("native")
+		sn     = client.SnapshotService(snapshotterName)
 	)
 
 	l, err := ls.Create(ctx, leases.WithRandomID())
@@ -55,9 +56,9 @@ func TestLeaseResources(t *testing.T) {
 	defer ls.Delete(ctx, l, leases.SynchronousDelete)
 
 	// step 1: download image
-	imageName := "k8s.gcr.io/pause:3.5"
+	imageName := imagelist.Get(imagelist.Pause)
 
-	image, err := client.Pull(ctx, imageName, WithPullUnpack, WithPullSnapshotter("native"))
+	image, err := client.Pull(ctx, imageName, WithPullUnpack, WithPullSnapshotter(snapshotterName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +87,7 @@ func TestLeaseResources(t *testing.T) {
 	// step 2: reference snapshotter with lease
 	r := leases.Resource{
 		ID:   chainID.String(),
-		Type: "snapshots/native",
+		Type: "snapshots/" + snapshotterName,
 	}
 
 	if err := ls.AddResource(ctx, l, r); err != nil {

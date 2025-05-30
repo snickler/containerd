@@ -1,11 +1,11 @@
-// +build linux
+//go:build linux
 
 package apparmor
 
 import (
 	"testing"
 
-	"gotest.tools/v3/assert"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestCleanProfileName(t *testing.T) {

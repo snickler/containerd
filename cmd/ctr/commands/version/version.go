@@ -20,22 +20,26 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/version"
-	"github.com/urfave/cli"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/version"
+	"github.com/urfave/cli/v2"
 )
 
 // Command is a cli command to output the client and containerd server version
-var Command = cli.Command{
+var Command = &cli.Command{
 	Name:  "version",
-	Usage: "print the client and server versions",
-	Action: func(context *cli.Context) error {
+	Usage: "Print the client and server versions",
+	Action: func(cliContext *cli.Context) error {
+		if cliContext.NArg() != 0 {
+			return fmt.Errorf("extra arguments: %v", cliContext.Args())
+		}
+
 		fmt.Println("Client:")
 		fmt.Println("  Version: ", version.Version)
 		fmt.Println("  Revision:", version.Revision)
 		fmt.Println("  Go version:", version.GoVersion)
 		fmt.Println("")
-		client, ctx, cancel, err := commands.NewClient(context)
+		client, ctx, cancel, err := commands.NewClient(cliContext)
 		if err != nil {
 			return err
 		}

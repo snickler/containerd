@@ -17,7 +17,6 @@
 package integration
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
@@ -25,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/integration/images"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -65,9 +65,7 @@ func TestPodHostname(t *testing.T) {
 			if test.needsHostNetwork && goruntime.GOOS == "windows" {
 				t.Skip("Skipped on Windows.")
 			}
-			testPodLogDir, err := ioutil.TempDir("/tmp", "hostname")
-			require.NoError(t, err)
-			defer os.RemoveAll(testPodLogDir)
+			testPodLogDir := t.TempDir()
 
 			opts := append(test.opts, WithPodLogDirectory(testPodLogDir))
 			t.Log("Create a sandbox with hostname")
@@ -89,7 +87,7 @@ func TestPodHostname(t *testing.T) {
 			}
 
 			var (
-				testImage     = GetImage(BusyBox)
+				testImage     = images.Get(images.BusyBox)
 				containerName = "test-container"
 			)
 
@@ -121,7 +119,7 @@ func TestPodHostname(t *testing.T) {
 				return false, nil
 			}, time.Second, 30*time.Second))
 
-			content, err := ioutil.ReadFile(filepath.Join(testPodLogDir, containerName))
+			content, err := os.ReadFile(filepath.Join(testPodLogDir, containerName))
 			assert.NoError(t, err)
 
 			t.Log("Search hostname env in container log")

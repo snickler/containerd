@@ -23,61 +23,62 @@ import (
 	"os"
 
 	"github.com/containerd/console"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/oci"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/log"
+	"github.com/urfave/cli/v2"
 )
 
-//TODO:(jessvalarezo) exec-id is optional here, update to required arg
-var execCommand = cli.Command{
-	Name:           "exec",
-	Usage:          "execute additional processes in an existing container",
-	ArgsUsage:      "[flags] CONTAINER CMD [ARG...]",
-	SkipArgReorder: true,
+var execCommand = &cli.Command{
+	Name:      "exec",
+	Usage:     "Execute additional processes in an existing container",
+	ArgsUsage: "[flags] CONTAINER CMD [ARG...]",
 	Flags: []cli.Flag{
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "cwd",
-			Usage: "working directory of the new process",
+			Usage: "Working directory of the new process",
 		},
-		cli.BoolFlag{
-			Name:  "tty,t",
-			Usage: "allocate a TTY for the container",
+		&cli.BoolFlag{
+			Name:    "tty",
+			Aliases: []string{"t"},
+			Usage:   "Allocate a TTY for the container",
 		},
-		cli.BoolFlag{
-			Name:  "detach,d",
-			Usage: "detach from the task after it has started execution",
+		&cli.BoolFlag{
+			Name:    "detach",
+			Aliases: []string{"d"},
+			Usage:   "Detach from the task after it has started execution",
 		},
-		cli.StringFlag{
-			Name:  "exec-id",
-			Usage: "exec specific id for the process",
+		&cli.StringFlag{
+			Name:     "exec-id",
+			Required: true,
+			Usage:    "Exec specific id for the process",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "fifo-dir",
-			Usage: "directory used for storing IO FIFOs",
+			Usage: "Directory used for storing IO FIFOs",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "log-uri",
-			Usage: "log uri for custom shim logging",
+			Usage: "Log uri for custom shim logging",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "user",
-			Usage: "user id or name",
+			Usage: "User id or name",
 		},
 	},
-	Action: func(context *cli.Context) error {
+	Action: func(cliContext *cli.Context) error {
 		var (
-			id     = context.Args().First()
-			args   = context.Args().Tail()
-			tty    = context.Bool("tty")
-			detach = context.Bool("detach")
+			id     = cliContext.Args().First()
+			args   = cliContext.Args().Tail()
+			tty    = cliContext.Bool("tty")
+			detach = cliContext.Bool("detach")
 		)
 		if id == "" {
 			return errors.New("container id must be provided")
 		}
-		client, ctx, cancel, err := commands.NewClient(context)
+		client, ctx, cancel, err := commands.NewClient(cliContext)
 		if err != nil {
 			return err
 		}
@@ -90,7 +91,7 @@ var execCommand = cli.Command{
 		if err != nil {
 			return err
 		}
-		if user := context.String("user"); user != "" {
+		if user := cliContext.String("user"); user != "" {
 			c, err := container.Info(ctx)
 			if err != nil {
 				return err
@@ -103,6 +104,10 @@ var execCommand = cli.Command{
 		pspec := spec.Process
 		pspec.Terminal = tty
 		pspec.Args = args
+
+		if cwd := cliContext.String("cwd"); cwd != "" {
+			pspec.Cwd = cwd
+		}
 
 		task, err := container.Task(ctx, nil)
 		if err != nil {
@@ -117,8 +122,8 @@ var execCommand = cli.Command{
 			con console.Console
 		)
 
-		fifoDir := context.String("fifo-dir")
-		logURI := context.String("log-uri")
+		fifoDir := cliContext.String("fifo-dir")
+		logURI := cliContext.String("log-uri")
 		ioOpts := []cio.Opt{cio.WithFIFODir(fifoDir)}
 		switch {
 		case tty && logURI != "":
@@ -145,7 +150,7 @@ var execCommand = cli.Command{
 			ioCreator = cio.NewCreator(append([]cio.Opt{cio.WithStreams(stdinC, os.Stdout, os.Stderr)}, ioOpts...)...)
 		}
 
-		process, err := task.Exec(ctx, context.String("exec-id"), pspec, ioCreator)
+		process, err := task.Exec(ctx, cliContext.String("exec-id"), pspec, ioCreator)
 		if err != nil {
 			return err
 		}
@@ -170,7 +175,7 @@ var execCommand = cli.Command{
 		}
 		if tty {
 			if err := HandleConsoleResize(ctx, process, con); err != nil {
-				logrus.WithError(err).Error("console resize")
+				log.L.WithError(err).Error("console resize")
 			}
 		} else {
 			sigc := commands.ForwardAllSignals(ctx, process)
@@ -182,7 +187,7 @@ var execCommand = cli.Command{
 			return err
 		}
 		if code != 0 {
-			return cli.NewExitError("", int(code))
+			return cli.Exit("", int(code))
 		}
 		return nil
 	},

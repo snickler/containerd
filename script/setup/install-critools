@@ -22,20 +22,30 @@ set -eu -o pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" > /dev/null 2>&1; pwd -P)"
 
-cd "$GOPATH"
-go get -u github.com/onsi/ginkgo/ginkgo
+# e2e will fail with "sudo: command not found"
+SUDO=''
+if (( $EUID != 0 )); then
+    # The actuated ARM64 env needs PATH=$PATH to get `go` path. Otherwise
+    # `make install` recipe will fail.
+    SUDO="sudo -E PATH=$PATH"
+fi
+
+cd "$(go env GOPATH)"
+go install github.com/onsi/ginkgo/v2/ginkgo@v2.9.2
 
 : "${CRITEST_COMMIT:=$(cat "${script_dir}/critools-version")}"
+: "${DESTDIR:=""}"
+: "${CRI_TOOLS_REPO:=https://github.com/kubernetes-sigs/cri-tools.git}"
 
 TMPROOT=$(mktemp -d)
-git clone https://github.com/kubernetes-sigs/cri-tools.git "${TMPROOT}"/cri-tools
+git clone "${CRI_TOOLS_REPO}" "${TMPROOT}/cri-tools"
 pushd "${TMPROOT}"/cri-tools
 git checkout "$CRITEST_COMMIT"
 make
-make install -e DESTDIR=${DESTDIR:=''} BINDIR=/usr/local/bin
+$SUDO make install -e DESTDIR="${DESTDIR}" BINDIR=/usr/local/bin
 
-mkdir -p ${DESTDIR:=''}/etc/
-cat << EOF | tee ${DESTDIR:=''}/etc/crictl.yaml
+mkdir -p "${DESTDIR}/etc/"
+$SUDO cat << EOF | $SUDO tee "${DESTDIR}/etc/crictl.yaml"
 runtime-endpoint: unix:///run/containerd/containerd.sock
 EOF
 

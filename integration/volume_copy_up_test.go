@@ -17,24 +17,42 @@
 package integration
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"os/exec"
-	goruntime "runtime"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/integration/images"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
+const (
+	containerUserName = "ContainerUser"
+	// containerUserSID is a well known SID that is set on the
+	// ContainerUser username inside a Windows container.
+	containerUserSID = "S-1-5-93-2-2"
+)
+
+type volumeFile struct {
+	fileName string
+	contents string
+}
+
+type containerVolume struct {
+	containerPath string
+	files         []volumeFile
+}
+
 func TestVolumeCopyUp(t *testing.T) {
-	if goruntime.GOOS == "windows" {
-		// TODO(claudiub): Remove this when the volume-copy-up image has Windows support.
-		// https://github.com/containerd/containerd/pull/5162
-		t.Skip("Skipped on Windows.")
-	}
 	var (
-		testImage   = GetImage(VolumeCopyUp)
+		testImage   = images.Get(images.VolumeCopyUp)
 		execTimeout = time.Minute
 	)
 
@@ -47,7 +65,7 @@ func TestVolumeCopyUp(t *testing.T) {
 	cnConfig := ContainerConfig(
 		"container",
 		testImage,
-		WithCommand("tail", "-f", "/dev/null"),
+		WithCommand("sleep", "150"),
 	)
 	cn, err := runtimeService.CreateContainer(sb, cnConfig, sbConfig)
 	require.NoError(t, err)
@@ -55,43 +73,106 @@ func TestVolumeCopyUp(t *testing.T) {
 	t.Logf("Start the container")
 	require.NoError(t, runtimeService.StartContainer(cn))
 
-	// gcr.io/k8s-cri-containerd/volume-copy-up:2.0 contains a test_dir
-	// volume, which contains a test_file with content "test_content".
-	t.Logf("Check whether volume contains the test file")
-	stdout, stderr, err := runtimeService.ExecSync(cn, []string{
-		"cat",
-		"/test_dir/test_file",
-	}, execTimeout)
+	expectedVolumes := []containerVolume{
+		{
+			containerPath: "/test_dir",
+			files: []volumeFile{
+				{
+					fileName: "test_file",
+					contents: "test_content\n",
+				},
+			},
+		},
+		{
+			containerPath: "/:colon_prefixed",
+			files: []volumeFile{
+				{
+					fileName: "colon_prefixed_file",
+					contents: "test_content\n",
+				},
+			},
+		},
+		{
+			containerPath: "/C:/weird_test_dir",
+			files: []volumeFile{
+				{
+					fileName: "weird_test_file",
+					contents: "test_content\n",
+				},
+			},
+		},
+	}
+
+	if runtime.GOOS == "windows" {
+		expectedVolumes = []containerVolume{
+			{
+				containerPath: "C:\\test_dir",
+				files: []volumeFile{
+					{
+						fileName: "test_file",
+						contents: "test_content\n",
+					},
+				},
+			},
+			{
+				containerPath: "D:",
+				files:         []volumeFile{},
+			},
+		}
+	}
+
+	volumeMappings, err := getContainerBindVolumes(t, cn)
 	require.NoError(t, err)
-	assert.Empty(t, stderr)
-	assert.Equal(t, "test_content\n", string(stdout))
 
 	t.Logf("Check host path of the volume")
-	hostCmd := fmt.Sprintf("find %s/containers/%s/volumes/*/test_file | xargs cat", *criRoot, cn)
-	output, err := exec.Command("sh", "-c", hostCmd).CombinedOutput()
+	for _, vol := range expectedVolumes {
+		_, ok := volumeMappings[vol.containerPath]
+		assert.Equalf(t, true, ok, "expected to find volume %s", vol.containerPath)
+	}
+
+	// ghcr.io/containerd/volume-copy-up:2.2 contains 3 volumes on Linux and 2 volumes on Windows.
+	// On linux, each of the volumes contains a single file, all with the same conrent. On Windows,
+	// non C volumes defined in the image start out as empty.
+	for _, vol := range expectedVolumes {
+		files, err := os.ReadDir(volumeMappings[vol.containerPath])
+		require.NoError(t, err)
+		assert.Equal(t, len(vol.files), len(files))
+
+		for _, file := range vol.files {
+			t.Logf("Check whether volume %s contains the test file %s", vol.containerPath, file.fileName)
+			stdout, stderr, err := runtimeService.ExecSync(cn, []string{
+				"cat",
+				filepath.ToSlash(filepath.Join(vol.containerPath, file.fileName)),
+			}, execTimeout)
+			require.NoError(t, err)
+			assert.Empty(t, stderr)
+			assert.Equal(t, file.contents, string(stdout))
+		}
+	}
+
+	testFilePath := filepath.Join(volumeMappings[expectedVolumes[0].containerPath], expectedVolumes[0].files[0].fileName)
+	inContainerPath := filepath.Join(expectedVolumes[0].containerPath, expectedVolumes[0].files[0].fileName)
+	contents, err := os.ReadFile(testFilePath)
 	require.NoError(t, err)
-	assert.Equal(t, "test_content\n", string(output))
+	assert.Equal(t, "test_content\n", string(contents))
 
 	t.Logf("Update volume from inside the container")
 	_, _, err = runtimeService.ExecSync(cn, []string{
 		"sh",
 		"-c",
-		"echo new_content > /test_dir/test_file",
+		fmt.Sprintf("echo new_content > %s", filepath.ToSlash(inContainerPath)),
 	}, execTimeout)
 	require.NoError(t, err)
 
 	t.Logf("Check whether host path of the volume is updated")
-	output, err = exec.Command("sh", "-c", hostCmd).CombinedOutput()
+	contents, err = os.ReadFile(testFilePath)
 	require.NoError(t, err)
-	assert.Equal(t, "new_content\n", string(output))
+	assert.Equal(t, "new_content\n", string(contents))
 }
 
 func TestVolumeOwnership(t *testing.T) {
-	if goruntime.GOOS == "windows" {
-		t.Skip("Skipped on Windows.")
-	}
 	var (
-		testImage   = GetImage(VolumeOwnership)
+		testImage   = images.Get(images.VolumeOwnership)
 		execTimeout = time.Minute
 	)
 
@@ -104,7 +185,7 @@ func TestVolumeOwnership(t *testing.T) {
 	cnConfig := ContainerConfig(
 		"container",
 		testImage,
-		WithCommand("tail", "-f", "/dev/null"),
+		WithCommand("sleep", "150"),
 	)
 	cn, err := runtimeService.CreateContainer(sb, cnConfig, sbConfig)
 	require.NoError(t, err)
@@ -112,19 +193,65 @@ func TestVolumeOwnership(t *testing.T) {
 	t.Logf("Start the container")
 	require.NoError(t, runtimeService.StartContainer(cn))
 
-	// gcr.io/k8s-cri-containerd/volume-ownership:2.0 contains a test_dir
-	// volume, which is owned by nobody:nogroup.
+	// ghcr.io/containerd/volume-ownership:2.1 contains a test_dir
+	// volume, which is owned by 65534:65534 (nobody:nogroup, or nobody:nobody).
+	// On Windows, the folder is situated in C:\volumes\test_dir and is owned
+	// by ContainerUser (SID: S-1-5-93-2-2). A helper tool get_owner.exe should
+	// exist inside the container that returns the owner in the form of USERNAME:SID.
 	t.Logf("Check ownership of test directory inside container")
-	stdout, stderr, err := runtimeService.ExecSync(cn, []string{
-		"stat", "-c", "%U:%G", "/test_dir",
-	}, execTimeout)
+
+	volumePath := "/test_dir"
+	cmd := []string{
+		"stat", "-c", "%u:%g", volumePath,
+	}
+	expectedContainerOutput := "65534:65534\n"
+	expectedHostOutput := "65534:65534\n"
+	if runtime.GOOS == "windows" {
+		volumePath = "C:\\volumes\\test_dir"
+		cmd = []string{
+			"C:\\bin\\get_owner.exe",
+			volumePath,
+		}
+		expectedContainerOutput = fmt.Sprintf("%s:%s", containerUserName, containerUserSID)
+		// The username is unknown on the host, but we can still get the SID.
+		expectedHostOutput = containerUserSID
+	}
+	stdout, stderr, err := runtimeService.ExecSync(cn, cmd, execTimeout)
 	require.NoError(t, err)
 	assert.Empty(t, stderr)
-	assert.Equal(t, "nobody:nogroup\n", string(stdout))
+	assert.Equal(t, expectedContainerOutput, string(stdout))
 
 	t.Logf("Check ownership of test directory on the host")
-	hostCmd := fmt.Sprintf("find %s/containers/%s/volumes/* | xargs stat -c %%U:%%G", *criRoot, cn)
-	output, err := exec.Command("sh", "-c", hostCmd).CombinedOutput()
+	volumePaths, err := getContainerBindVolumes(t, cn)
 	require.NoError(t, err)
-	assert.Equal(t, "nobody:nogroup\n", string(output))
+
+	output, err := getOwnership(volumePaths[volumePath])
+	require.NoError(t, err)
+	assert.Equal(t, expectedHostOutput, output)
+}
+
+func getContainerBindVolumes(t *testing.T, containerID string) (map[string]string, error) {
+	client, err := RawRuntimeClient()
+	require.NoError(t, err, "failed to get raw grpc runtime service client")
+	request := &v1.ContainerStatusRequest{
+		ContainerId: containerID,
+		Verbose:     true,
+	}
+	response, err := client.ContainerStatus(context.TODO(), request)
+	require.NoError(t, err)
+	ret := make(map[string]string)
+
+	mounts := struct {
+		RuntimeSpec struct {
+			Mounts []specs.Mount `json:"mounts"`
+		} `json:"runtimeSpec"`
+	}{}
+
+	info := response.Info["info"]
+	err = json.Unmarshal([]byte(info), &mounts)
+	require.NoError(t, err)
+	for _, mount := range mounts.RuntimeSpec.Mounts {
+		ret[mount.Destination] = mount.Source
+	}
+	return ret, nil
 }

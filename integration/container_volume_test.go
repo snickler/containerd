@@ -17,12 +17,13 @@
 package integration
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/integration/images"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -36,7 +37,7 @@ func createRegularFile(basePath, content string) (string, error) {
 	}
 
 	newFile := filepath.Join(newFolder, "foo.txt")
-	err = ioutil.WriteFile(newFile, []byte(content), 0644)
+	err = os.WriteFile(newFile, []byte(content), 0644)
 	return filepath.Join("regular", "foo.txt"), err
 }
 
@@ -81,15 +82,9 @@ func TestContainerSymlinkVolumes(t *testing.T) {
 			createFileFn: symlinkedFileInSymlinkedFolder,
 		},
 	} {
-		testCase := testCase // capture range variable
 		t.Run(name, func(t *testing.T) {
-			testPodLogDir, err := ioutil.TempDir("", "symlink-test")
-			require.NoError(t, err)
-			defer os.RemoveAll(testPodLogDir)
-
-			testVolDir, err := ioutil.TempDir("", "symlink-test-vol")
-			require.NoError(t, err)
-			defer os.RemoveAll(testVolDir)
+			testPodLogDir := t.TempDir()
+			testVolDir := t.TempDir()
 
 			content := "hello there\n"
 			regularFile, err := createRegularFile(testVolDir, content)
@@ -104,9 +99,14 @@ func TestContainerSymlinkVolumes(t *testing.T) {
 			)
 
 			var (
-				testImage     = GetImage(BusyBox)
-				containerName = "test-container"
+				testImage          = images.Get(images.BusyBox)
+				containerName      = "test-container"
+				containerMountPath = "/mounted_file"
 			)
+
+			if goruntime.GOOS == "windows" {
+				containerMountPath = filepath.Clean("C:" + containerMountPath)
+			}
 
 			EnsureImageExists(t, testImage)
 
@@ -114,9 +114,9 @@ func TestContainerSymlinkVolumes(t *testing.T) {
 			cnConfig := ContainerConfig(
 				containerName,
 				testImage,
-				WithCommand("cat", "/mounted_file"),
+				WithCommand("cat", containerMountPath),
 				WithLogPath(containerName),
-				WithVolumeMount(file, "/mounted_file"),
+				WithVolumeMount(file, containerMountPath),
 			)
 
 			cn, err := runtimeService.CreateContainer(sb, cnConfig, sbConfig)
@@ -137,7 +137,7 @@ func TestContainerSymlinkVolumes(t *testing.T) {
 				return false, nil
 			}, time.Second, 30*time.Second))
 
-			output, err := ioutil.ReadFile(filepath.Join(testPodLogDir, containerName))
+			output, err := os.ReadFile(filepath.Join(testPodLogDir, containerName))
 			assert.NoError(t, err)
 
 			assert.Contains(t, string(output), content)

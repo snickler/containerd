@@ -17,33 +17,46 @@
 package oci
 
 import (
-	"github.com/pkg/errors"
-	"github.com/urfave/cli"
+	"fmt"
 
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
+	"github.com/urfave/cli/v2"
+
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/platforms"
 )
 
 // Command is the parent for all OCI related tools under 'oci'
-var Command = cli.Command{
+var Command = &cli.Command{
 	Name:  "oci",
 	Usage: "OCI tools",
-	Subcommands: []cli.Command{
+	Subcommands: []*cli.Command{
 		defaultSpecCommand,
 	},
 }
 
-var defaultSpecCommand = cli.Command{
+var defaultSpecCommand = &cli.Command{
 	Name:  "spec",
-	Usage: "see the output of the default OCI spec",
-	Action: func(context *cli.Context) error {
-		ctx, cancel := commands.AppContext(context)
+	Usage: "See the output of the default OCI spec",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "platform",
+			Usage: "Platform of the spec to print (Examples: 'linux/arm64', 'windows/amd64')",
+		},
+	},
+	Action: func(cliContext *cli.Context) error {
+		ctx, cancel := commands.AppContext(cliContext)
 		defer cancel()
 
-		spec, err := oci.GenerateSpec(ctx, nil, &containers.Container{})
+		platform := platforms.DefaultString()
+		if plat := cliContext.String("platform"); plat != "" {
+			platform = plat
+		}
+
+		spec, err := oci.GenerateSpecWithPlatform(ctx, nil, platform, &containers.Container{})
 		if err != nil {
-			return errors.Wrap(err, "failed to generate spec")
+			return fmt.Errorf("failed to generate spec: %w", err)
 		}
 
 		commands.PrintAsJSON(spec)

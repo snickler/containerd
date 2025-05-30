@@ -1,42 +1,219 @@
 # Getting started with containerd
 
-There are many different ways to use containerd.
-If you are a developer working on containerd you can use the `ctr` tool to quickly test features and functionality without writing extra code.
-However, if you want to integrate containerd into your project we have an easy to use client package that allows you to work with containerd.
+## Installing containerd
 
-In this guide we will pull and run a redis server with containerd using the client package.
-We will assume that you are running a modern linux host for this example with a compatible build of `runc`.
-Please refer to [RUNC.md](/docs/RUNC.md) for the currently supported version of `runc`.
-This project requires Go 1.9.x or above.
-If you need to install Go or update your currently installed one, please refer to Go install page at https://golang.org/doc/install.
+### Option 1: From the official binaries
 
-## Starting containerd
+The official binary releases of containerd are available for the `amd64` (also known as `x86_64`) and `arm64` (also known as `aarch64`) architectures.
 
-You can download one of the latest builds for containerd on the [github releases](https://github.com/containerd/containerd/releases) page and then use your favorite process supervisor to get the daemon started.
-If you are using systemd, we have a `containerd.service` file at the root of the repository that you can use.
+Typically, you will have to install [runc](https://github.com/opencontainers/runc/releases) and [CNI plugins](https://github.com/containernetworking/plugins/releases)
+from their official sites too.
 
-The daemon also uses a configuration file located in `/etc/containerd/config.toml` for specifying daemon level options.
-A sample configuration file looks like this:
+#### Step 1: Installing containerd
 
-```toml
-oom_score = -999
+Download the `containerd-<VERSION>-<OS>-<ARCH>.tar.gz` archive from https://github.com/containerd/containerd/releases ,
+verify its sha256sum, and extract it under `/usr/local`:
 
-[debug]
-        level = "debug"
-
-[metrics]
-        address = "127.0.0.1:1338"
-
-[plugins.linux]
-        runtime = "runc"
-        shim_debug = true
+```console
+$ tar Cxzvf /usr/local containerd-1.6.2-linux-amd64.tar.gz
+bin/
+bin/containerd-shim-runc-v2
+bin/containerd-shim
+bin/ctr
+bin/containerd-shim-runc-v1
+bin/containerd
+bin/containerd-stress
 ```
+
+The `containerd` binary is built dynamically for glibc-based Linux distributions such as Ubuntu and Rocky Linux.
+This binary may not work on musl-based distributions such as Alpine Linux.
+Users of such distributions may have to install containerd from the source or a third party package.
+
+> **FAQ**: For Kubernetes, do I need to download `cri-containerd-(cni-)<VERSION>-<OS-<ARCH>.tar.gz` too?
+>
+> **Answer**: No.
+>
+> As the Kubernetes CRI feature has been already included in `containerd-<VERSION>-<OS>-<ARCH>.tar.gz`,
+> you do not need to download the `cri-containerd-....` archives to use CRI.
+>
+> The `cri-containerd-...` archives are [deprecated](https://github.com/containerd/containerd/blob/main/RELEASES.md#deprecated-features),
+> do not work on old Linux distributions, and will be removed in containerd 2.0.
+
+
+##### systemd
+If you intend to start containerd via systemd, you should also download the `containerd.service` unit file from
+https://raw.githubusercontent.com/containerd/containerd/main/containerd.service into `/usr/local/lib/systemd/system/containerd.service`,
+and run the following commands:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now containerd
+```
+
+#### Step 2: Installing runc
+
+Download the `runc.<ARCH>` binary from https://github.com/opencontainers/runc/releases ,
+verify its sha256sum, and install it as `/usr/local/sbin/runc`.
+
+```console
+$ install -m 755 runc.amd64 /usr/local/sbin/runc
+```
+
+The binary is built statically and should work on any Linux distribution.
+
+#### Step 3: Installing CNI plugins
+
+Download the `cni-plugins-<OS>-<ARCH>-<VERSION>.tgz` archive from https://github.com/containernetworking/plugins/releases ,
+verify its sha256sum, and extract it under `/opt/cni/bin`:
+
+```console
+$ mkdir -p /opt/cni/bin
+$ tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-v1.1.1.tgz
+./
+./macvlan
+./static
+./vlan
+./portmap
+./host-local
+./vrf
+./bridge
+./tuning
+./firewall
+./host-device
+./sbr
+./loopback
+./dhcp
+./ptp
+./ipvlan
+./bandwidth
+```
+
+The binaries are built statically and should work on any Linux distribution.
+
+### Option 2: From `apt-get` or `dnf`
+
+The `containerd.io` packages in DEB and RPM formats are distributed by Docker (not by the containerd project).
+See the Docker documentation for how to set up `apt-get` or `dnf` to install `containerd.io` packages:
+- [CentOS](https://docs.docker.com/engine/install/centos/)
+- [Debian](https://docs.docker.com/engine/install/debian/)
+- [Fedora](https://docs.docker.com/engine/install/fedora/)
+- [Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+
+The `containerd.io` package contains runc too, but does not contain CNI plugins.
+
+### Option 3: From source
+
+To install containerd and its dependencies from the source, see [`BUILDING.md`](/BUILDING.md).
+
+## Installing containerd on Windows
+
+From an elevated PowerShell session (_running as Admin_) run the following commands:
+
+```PowerShell
+# If containerd previously installed run:
+Stop-Service containerd
+
+# Download and extract desired containerd Windows binaries
+$Version="1.7.13"	# update to your preferred version
+$Arch = "amd64"	# arm64 also available
+curl.exe -LO https://github.com/containerd/containerd/releases/download/v$Version/containerd-$Version-windows-$Arch.tar.gz
+tar.exe xvf .\containerd-$Version-windows-$Arch.tar.gz
+
+# Copy
+Copy-Item -Path .\bin -Destination $Env:ProgramFiles\containerd -Recurse -Force
+
+# add the binaries (containerd.exe, ctr.exe) in $env:Path
+$Path = [Environment]::GetEnvironmentVariable("PATH", "Machine") + [IO.Path]::PathSeparator + "$Env:ProgramFiles\containerd"
+[Environment]::SetEnvironmentVariable( "Path", $Path, "Machine")
+# reload path, so you don't have to open a new PS terminal later if needed
+$Env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
+# configure
+containerd.exe config default | Out-File $Env:ProgramFiles\containerd\config.toml -Encoding ascii
+# Review the configuration. Depending on setup you may want to adjust:
+# - the sandbox_image (Kubernetes pause image)
+# - cni bin_dir and conf_dir locations
+Get-Content $Env:ProgramFiles\containerd\config.toml
+
+# Register and start service
+containerd.exe --register-service
+Start-Service containerd
+```
+
+> **Tip for Running `containerd` Service on Windows:**
+>
+> `containerd` logs are not persisted when we start it as a service
+using Windows Service Manager. [`nssm`](https://nssm.cc) can be used to
+configure logs to go into a cyclic buffer:
+> ```powershell
+> nssm.exe install containerd
+> nssm.exe set containerd AppStdout "\containerd.log"
+> nssm.exe set containerd AppStderr "\containerd.err.log"
+> nssm.exe start containerd
+> # to stop:
+> nssm.exe stop containerd
+> ```
+
+## Interacting with containerd via CLI
+
+There are several command line interface (CLI) projects for interacting with containerd:
+
+Name      | Community             | API    | Target             | Web site                                    |
+----------|-----------------------|------- | -------------------|---------------------------------------------|
+`ctr`     | containerd            | Native | For debugging only | (None, see `ctr --help` to learn the usage) |
+`nerdctl` | containerd (non-core) | Native | General-purpose    | https://github.com/containerd/nerdctl       |
+`crictl`  | Kubernetes SIG-node   | CRI    | For debugging only | https://github.com/kubernetes-sigs/cri-tools/blob/master/docs/crictl.md |
+
+While the `ctr` tool is bundled together with containerd, it should be noted the `ctr` tool is solely made for debugging containerd.
+The [`nerdctl`](https://github.com/containerd/nerdctl) tool provides stable and human-friendly user experience.
+
+Example (`ctr`):
+```bash
+ctr images pull docker.io/library/redis:alpine
+ctr run docker.io/library/redis:alpine redis
+```
+
+Example (`nerdctl`):
+```bash
+nerdctl run --name redis redis:alpine
+```
+
+## Setting up containerd for Kubernetes
+
+containerd has built-in support for Kubernetes Container Runtime Interface (CRI).
+
+To set up containerd nodes for managed Kubernetes services, see the service providers' documentations:
+- [Amazon Elastic Kubernetes Service](https://docs.aws.amazon.com/eks/latest/userguide/dockershim-deprecation.html)
+- [Azure Kubernetes Service](https://docs.microsoft.com/en-us/azure/aks/cluster-configuration)
+- [Google Kubernetes Engine](https://cloud.google.com/kubernetes-engine/docs/concepts/using-containerd)
+
+For non-managed environments, see the following Kubernetes documentations:
+- [Getting started / Production environment / Container runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+- [Getting started / Production environment / Installing Kubernetes with deployment tools](https://kubernetes.io/docs/setup/production-environment/tools/)
+
+- - -
+
+# Advanced topics
+
+## Customizing containerd
+
+containerd uses a configuration file located in `/etc/containerd/config.toml` for specifying daemon level options.
+A sample configuration file can be found [here](/docs/man/containerd-config.toml.5.md).
 
 The default configuration can be generated via `containerd config default > /etc/containerd/config.toml`.
 
-## Connecting to containerd
+## Implementing your own containerd client
+There are many different ways to use containerd.
+If you are a developer working on containerd you can use the `ctr` tool or the `nerdctl` tool to quickly test features and functionality without writing extra code.
+However, if you want to integrate containerd into your project we have an easy to use client package that allows you to work with containerd.
 
-We will start a new `main.go` file and import the containerd root package that contains the client.
+In this guide we will pull and run a redis server with containerd using the client package.
+This project requires a recent version of Go.
+See the header of [`go.mod`](https://github.com/containerd/containerd/blob/main/go.mod) for the recommended Go version.
+
+### Connecting to containerd
+
+We will start a new `main.go` file and import the containerd client package.
 
 
 ```go
@@ -45,7 +222,7 @@ package main
 import (
 	"log"
 
-	"github.com/containerd/containerd"
+	containerd "github.com/containerd/containerd/v2/client"
 )
 
 func main() {
@@ -75,7 +252,7 @@ We should also set a namespace for our guide after creating the context.
 
 Having a namespace for our usage ensures that containers, images, and other resources without containerd do not conflict with other users of a single daemon.
 
-## Pulling the redis image
+### Pulling the redis image
 
 Now that we have a client to work with we need to pull an image.
 We can use the redis image based on Alpine Linux from the DockerHub.
@@ -99,8 +276,8 @@ import (
         "context"
         "log"
 
-        "github.com/containerd/containerd"
-        "github.com/containerd/containerd/namespaces"
+        containerd "github.com/containerd/containerd/v2/client"
+        "github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 func main() {
@@ -134,14 +311,17 @@ func redisExample() error {
 2017/08/13 17:43:21 Successfully pulled docker.io/library/redis:alpine image
 ```
 
-## Creating an OCI Spec and Container
+### Creating an OCI Spec and Container
 
 Now that we have an image to base our container off of, we need to generate an OCI runtime specification that the container can be based off of as well as the new container.
 
 containerd provides reasonable defaults for generating OCI runtime specs.
 There is also an `Opt` for modifying the default config based on the image that we pulled.
 
-The container will be based off of the image, use the runtime information in the spec that was just created, and we will allocate a new read-write snapshot so the container can store any persistent information.
+The container will be based off of the image, and we will:
+1. allocate a new read-write snapshot so the container can store any persistent information.
+2. create a new spec for the container.
+
 
 ```go
 	container, err := client.NewContainer(
@@ -171,9 +351,9 @@ import (
         "context"
         "log"
 
-        "github.com/containerd/containerd"
-        "github.com/containerd/containerd/oci"
-        "github.com/containerd/containerd/namespaces"
+        containerd "github.com/containerd/containerd/v2/client"
+        "github.com/containerd/containerd/v2/pkg/namespaces"
+        "github.com/containerd/containerd/v2/pkg/oci"
 )
 
 func main() {
@@ -222,7 +402,7 @@ Let's see it in action.
 2017/08/13 18:01:35 Successfully created container with ID redis-server and snapshot with ID redis-server-snapshot
 ```
 
-## Creating a running Task
+### Creating a running Task
 
 One thing that may be confusing at first for new containerd users is the separation between a `Container` and a `Task`.
 A container is a metadata object that resources are allocated and attached to.
@@ -256,7 +436,7 @@ If you are familiar with prometheus you can curl the containerd metrics endpoint
 
 Pretty cool right?
 
-## Task Wait and Start
+### Task Wait and Start
 
 Now that we have a task in the created state we need to make sure that we wait on the task to exit.
 It is essential to wait for the task to finish so that we can close our example and cleanup the resources that we created.
@@ -276,7 +456,7 @@ This makes sure that you do not encounter any races if the task has a simple pro
 
 Now we should see the `redis-server` logs in our terminal when we run the `main.go` file.
 
-## Killing the task
+### Killing the task
 
 Since we are running a long running server we will need to kill the task in order to exit out of our example.
 To do this we will simply call `Kill` on the task after waiting a couple of seconds so we have a chance to see the redis-server logs.
@@ -304,7 +484,7 @@ We got you covered.
 status, err := task.Delete(ctx)
 ```
 
-## Full Example
+### Full Example
 
 Here is the full example that we just put together.
 
@@ -318,10 +498,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 func main() {
@@ -370,7 +550,7 @@ func redisExample() error {
 	// make sure we wait before calling start
 	exitStatusC, err := task.Wait(ctx)
 	if err != nil {
-		fmt.Println(err)
+		return err
 	}
 
 	// call start on the task to execute the redis server
@@ -427,5 +607,6 @@ redis-server exited with status: 0
 
 In the end, we really did not write that much code when you use the client package.
 
-I hope this guide helped to get you up and running with containerd.
+- - -
+We hope this guide helped to get you up and running with containerd.
 Feel free to join the `#containerd` and `#containerd-dev` slack channels on Cloud Native Computing Foundation's (CNCF) slack - `cloud-native.slack.com` if you have any questions and like all things, if you want to help contribute to containerd or this guide, submit a pull request. [Get Invite to CNCF slack.](https://slack.cncf.io)

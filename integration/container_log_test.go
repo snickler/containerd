@@ -18,12 +18,13 @@ package integration
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/containerd/containerd/v2/integration/images"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,9 +32,7 @@ import (
 )
 
 func TestContainerLogWithoutTailingNewLine(t *testing.T) {
-	testPodLogDir, err := ioutil.TempDir("/tmp", "container-log-without-tailing-newline")
-	require.NoError(t, err)
-	defer os.RemoveAll(testPodLogDir)
+	testPodLogDir := t.TempDir()
 
 	t.Log("Create a sandbox with log directory")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "sandbox", "container-log-without-tailing-newline",
@@ -41,7 +40,7 @@ func TestContainerLogWithoutTailingNewLine(t *testing.T) {
 	)
 
 	var (
-		testImage     = GetImage(BusyBox)
+		testImage     = images.Get(images.BusyBox)
 		containerName = "test-container"
 	)
 
@@ -73,7 +72,7 @@ func TestContainerLogWithoutTailingNewLine(t *testing.T) {
 	}, time.Second, 30*time.Second))
 
 	t.Log("Check container log")
-	content, err := ioutil.ReadFile(filepath.Join(testPodLogDir, containerName))
+	content, err := os.ReadFile(filepath.Join(testPodLogDir, containerName))
 	assert.NoError(t, err)
 	checkContainerLog(t, string(content), []string{
 		fmt.Sprintf("%s %s %s", runtime.Stdout, runtime.LogTagPartial, "abcd"),
@@ -81,9 +80,7 @@ func TestContainerLogWithoutTailingNewLine(t *testing.T) {
 }
 
 func TestLongContainerLog(t *testing.T) {
-	testPodLogDir, err := ioutil.TempDir("/tmp", "long-container-log")
-	require.NoError(t, err)
-	defer os.RemoveAll(testPodLogDir)
+	testPodLogDir := t.TempDir()
 
 	t.Log("Create a sandbox with log directory")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "sandbox", "long-container-log",
@@ -91,7 +88,7 @@ func TestLongContainerLog(t *testing.T) {
 	)
 
 	var (
-		testImage     = GetImage(BusyBox)
+		testImage     = images.Get(images.BusyBox)
 		containerName = "test-container"
 	)
 
@@ -130,7 +127,7 @@ func TestLongContainerLog(t *testing.T) {
 	}, time.Second, 30*time.Second))
 
 	t.Log("Check container log")
-	content, err := ioutil.ReadFile(filepath.Join(testPodLogDir, containerName))
+	content, err := os.ReadFile(filepath.Join(testPodLogDir, containerName))
 	assert.NoError(t, err)
 	checkContainerLog(t, string(content), []string{
 		fmt.Sprintf("%s %s %s", runtime.Stdout, runtime.LogTagFull, strings.Repeat("a", maxSize-1)),
@@ -144,10 +141,10 @@ func checkContainerLog(t *testing.T, log string, messages []string) {
 	lines := strings.Split(strings.TrimSpace(log), "\n")
 	require.Len(t, lines, len(messages), "log line number should match")
 	for i, line := range lines {
-		parts := strings.SplitN(line, " ", 2)
-		require.Len(t, parts, 2)
-		_, err := time.Parse(time.RFC3339Nano, parts[0])
+		ts, msg, ok := strings.Cut(line, " ")
+		require.True(t, ok)
+		_, err := time.Parse(time.RFC3339Nano, ts)
 		assert.NoError(t, err, "timestamp should be in RFC3339Nano format")
-		assert.Equal(t, messages[i], parts[1], "log content should match")
+		assert.Equal(t, messages[i], msg, "log content should match")
 	}
 }

@@ -22,12 +22,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	. "github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/testsuite"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/pkg/errors"
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/content/testsuite"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
 )
 
 func newContentStore(ctx context.Context, root string) (context.Context, content.Store, func() error, error) {
@@ -37,13 +36,13 @@ func newContentStore(ctx context.Context, root string) (context.Context, content
 	}
 
 	var (
-		count uint64
+		count atomic.Uint64
 		cs    = client.ContentStore()
 		name  = testsuite.Name(ctx)
 	)
 
-	wrap := func(ctx context.Context) (context.Context, func(context.Context) error, error) {
-		n := atomic.AddUint64(&count, 1)
+	wrap := func(ctx context.Context, sharedNS bool) (context.Context, func(context.Context) error, error) {
+		n := count.Add(1)
 		ctx = namespaces.WithNamespace(ctx, fmt.Sprintf("%s-n%d", name, n))
 		return client.WithLease(ctx)
 	}
@@ -51,7 +50,7 @@ func newContentStore(ctx context.Context, root string) (context.Context, content
 	ctx = testsuite.SetContextWrapper(ctx, wrap)
 
 	return ctx, cs, func() error {
-		for i := uint64(1); i <= count; i++ {
+		for i := uint64(1); i <= count.Load(); i++ {
 			ctx = namespaces.WithNamespace(ctx, fmt.Sprintf("%s-n%d", name, i))
 			statuses, err := cs.ListStatuses(ctx)
 			if err != nil {
@@ -59,7 +58,7 @@ func newContentStore(ctx context.Context, root string) (context.Context, content
 			}
 			for _, st := range statuses {
 				if err := cs.Abort(ctx, st.Ref); err != nil && !errdefs.IsNotFound(err) {
-					return errors.Wrapf(err, "failed to abort %s", st.Ref)
+					return fmt.Errorf("failed to abort %s: %w", st.Ref, err)
 				}
 			}
 			err = cs.Walk(ctx, func(info content.Info) error {

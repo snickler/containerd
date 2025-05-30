@@ -1,4 +1,4 @@
-// +build linux darwin solaris
+//go:build !(freebsd || windows)
 
 /*
    Copyright The containerd Authors.

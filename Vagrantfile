@@ -15,19 +15,35 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-# Vagrantfile for cgroup2 and SELinux
+# Vagrantfile for Fedora and EL
 Vagrant.configure("2") do |config|
-  config.vm.box = "fedora/34-cloud-base"
+  config.vm.box = ENV["BOX"] ? ENV["BOX"].split("@")[0] : "fedora/41-cloud-base"
+  # BOX_VERSION is deprecated. Use "BOX=<BOX>@<BOX_VERSION>".
+  config.vm.box_version = ENV["BOX_VERSION"] || (ENV["BOX"].split("@")[1] if ENV["BOX"])
+
   memory = 4096
   cpus = 2
-  config.vm.provider :virtualbox do |v|
+  disk_size = 60
+  config.vm.provider :virtualbox do |v, o|
     v.memory = memory
     v.cpus = cpus
+    # Needs env var VAGRANT_EXPERIMENTAL="disks"
+    o.vm.disk :disk, size: "#{disk_size}GB", primary: true
+    v.customize ["modifyvm", :id, "--firmware", "efi"]
   end
   config.vm.provider :libvirt do |v|
     v.memory = memory
     v.cpus = cpus
+    v.machine_virtual_size = disk_size
+    # https://github.com/vagrant-libvirt/vagrant-libvirt/issues/1725#issuecomment-1454058646
+    # Needs `sudo cp /usr/share/OVMF/OVMF_VARS_4M.fd /var/lib/libvirt/qemu/nvram/`
+    v.loader = '/usr/share/OVMF/OVMF_CODE_4M.fd'
+    v.nvram = '/var/lib/libvirt/qemu/nvram/OVMF_VARS_4M.fd'
   end
+
+  config.vm.synced_folder ".", "/vagrant", type: "rsync"
+
+  config.vm.provision 'shell', path: 'script/resize-vagrant-root.sh'
 
   # Disabled by default. To run:
   #   vagrant up --provision-with=upgrade-packages
@@ -67,8 +83,22 @@ Vagrant.configure("2") do |config|
             libselinux-devel \
             lsof \
             make \
+            strace \
             ${INSTALL_PACKAGES}
     SHELL
+  end
+
+  # EL does not have /usr/local/{bin,sbin} in the PATH by default
+  config.vm.provision "setup-etc-environment", type: "shell", run: "once" do |sh|
+    sh.upload_path = "/tmp/vagrant-setup-etc-environment"
+    sh.inline = <<~SHELL
+        #!/usr/bin/env bash
+        set -eux -o pipefail
+        cat >> /etc/environment <<EOF
+PATH=/usr/local/go/bin:/usr/local/bin:/usr/local/sbin:$PATH
+EOF
+        source /etc/environment
+        SHELL
   end
 
   # To re-run this provisioner, installing a different version of go:
@@ -77,20 +107,17 @@ Vagrant.configure("2") do |config|
   config.vm.provision "install-golang", type: "shell", run: "once" do |sh|
     sh.upload_path = "/tmp/vagrant-install-golang"
     sh.env = {
-        'GO_VERSION': ENV['GO_VERSION'] || "1.16.6",
+        'GO_VERSION': ENV['GO_VERSION'] || "1.24.3",
     }
     sh.inline = <<~SHELL
         #!/usr/bin/env bash
         set -eux -o pipefail
         curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz" | tar Cxz /usr/local
-        cat >> /etc/environment <<EOF
-PATH=/usr/local/go/bin:$PATH
-EOF
-        source /etc/environment
         cat >> /etc/profile.d/sh.local <<EOF
 GOPATH=\\$HOME/go
 PATH=\\$GOPATH/bin:\\$PATH
 export GOPATH PATH
+git config --global --add safe.directory /vagrant
 EOF
     source /etc/profile.d/sh.local
     SHELL
@@ -135,7 +162,8 @@ EOF
         source /etc/environment
         source /etc/profile.d/sh.local
         set -eux -o pipefail
-        ${GOPATH}/src/github.com/containerd/containerd/script/setup/install-cni
+        cd ${GOPATH}/src/github.com/containerd/containerd
+        script/setup/install-cni
         PATH=/opt/cni/bin:$PATH type ${CNI_BINARIES} || true
     SHELL
   end
@@ -165,7 +193,7 @@ EOF
         source /etc/profile.d/sh.local
         set -eux -o pipefail
         cd ${GOPATH}/src/github.com/containerd/containerd
-        make BUILDTAGS="seccomp selinux no_aufs no_btrfs no_devmapper no_zfs" binaries install
+        make BUILDTAGS="seccomp selinux no_btrfs no_devmapper no_zfs" binaries install
         type containerd
         containerd --version
         chcon -v -t container_runtime_exec_t /usr/local/bin/{containerd,containerd-shim*}
@@ -185,6 +213,19 @@ EOF
       SHELL
   end
 
+  config.vm.provision "install-failpoint-binaries", type: "shell",  run: "once" do |sh|
+      sh.upload_path = "/tmp/vagrant-install-failpoint-binaries"
+      sh.inline = <<~SHELL
+        #!/usr/bin/env bash
+        source /etc/environment
+        source /etc/profile.d/sh.local
+        set -eux -o pipefail
+        ${GOPATH}/src/github.com/containerd/containerd/script/setup/install-failpoint-binaries
+        chcon -v -t container_runtime_exec_t $(type -ap containerd-shim-runc-fp-v1)
+        containerd-shim-runc-fp-v1 -v
+      SHELL
+  end
+
   # SELinux is Enforcing by default.
   # To set SELinux as Disabled on a VM that has already been provisioned:
   #   SELINUX=Disabled vagrant up --provision-with=selinux
@@ -201,8 +242,8 @@ EOF
     SHELL
   end
 
-  # SELinux is permissive by default (via provisioning) in this VM. To re-run with SELinux enforcing:
-  #   vagrant up --provision-with=selinux-enforcing,test-integration
+  # SELinux is Enforcing by default (via provisioning) in this VM. To re-run with SELinux disabled:
+  #   SELINUX=Disabled vagrant up --provision-with=selinux,test-integration
   #
   config.vm.provision "test-integration", type: "shell", run: "never" do |sh|
     sh.upload_path = "/tmp/test-integration"
@@ -210,6 +251,7 @@ EOF
         'RUNC_FLAVOR': ENV['RUNC_FLAVOR'] || "runc",
         'GOTEST': ENV['GOTEST'] || "go test",
         'GOTESTSUM_JUNITFILE': ENV['GOTESTSUM_JUNITFILE'],
+        'GOTESTSUM_JSONFILE': ENV['GOTESTSUM_JSONFILE'],
     }
     sh.inline = <<~SHELL
         #!/usr/bin/env bash
@@ -218,18 +260,50 @@ EOF
         set -eux -o pipefail
         rm -rf /var/lib/containerd-test /run/containerd-test
         cd ${GOPATH}/src/github.com/containerd/containerd
+        go test -v -count=1 -race ./core/metrics/cgroups
         make integration EXTRA_TESTFLAGS="-timeout 15m -no-criu -test.v" TEST_RUNTIME=io.containerd.runc.v2 RUNC_FLAVOR=$RUNC_FLAVOR
     SHELL
   end
 
-  # SELinux is permissive by default (via provisioning) in this VM. To re-run with SELinux enforcing:
-  #   vagrant up --provision-with=selinux-enforcing,test-cri
+  # SELinux is Enforcing by default (via provisioning) in this VM. To re-run with SELinux disabled:
+  #   SELINUX=Disabled vagrant up --provision-with=selinux,test-cri-integration
+  #
+  config.vm.provision "test-cri-integration", type: "shell", run: "never" do |sh|
+    sh.upload_path = "/tmp/test-cri-integration"
+    sh.env = {
+        'GOTEST': ENV['GOTEST'] || "go test",
+        'GOTESTSUM_JUNITFILE': ENV['GOTESTSUM_JUNITFILE'],
+        'GOTESTSUM_JSONFILE': ENV['GOTESTSUM_JSONFILE'],
+        'GITHUB_WORKSPACE': '',
+        'CGROUP_DRIVER': ENV['CGROUP_DRIVER'],
+    }
+    sh.inline = <<~SHELL
+        #!/usr/bin/env bash
+        source /etc/environment
+        source /etc/profile.d/sh.local
+        set -eux -o pipefail
+        cleanup() {
+          rm -rf /var/lib/containerd* /run/containerd* /tmp/containerd* /tmp/test* /tmp/failpoint* /tmp/nri*
+        }
+        cleanup
+        cd ${GOPATH}/src/github.com/containerd/containerd
+        # cri-integration.sh executes containerd from ./bin, not from $PATH .
+        make BUILDTAGS="seccomp selinux no_btrfs no_devmapper no_zfs" binaries bin/cri-integration.test
+        chcon -v -t container_runtime_exec_t ./bin/{containerd,containerd-shim*}
+        CONTAINERD_RUNTIME=io.containerd.runc.v2 ./script/test/cri-integration.sh
+        cleanup
+    SHELL
+  end
+
+  # SELinux is Enforcing by default (via provisioning) in this VM. To re-run with SELinux disabled:
+  #   SELINUX=Disabled vagrant up --provision-with=selinux,test-cri
   #
   config.vm.provision "test-cri", type: "shell", run: "never" do |sh|
     sh.upload_path = "/tmp/test-cri"
     sh.env = {
         'GOTEST': ENV['GOTEST'] || "go test",
         'REPORT_DIR': ENV['REPORT_DIR'],
+        'CGROUP_DRIVER': ENV['CGROUP_DRIVER'],
     }
     sh.inline = <<~SHELL
         #!/usr/bin/env bash
@@ -241,6 +315,7 @@ EOF
         function cleanup()
         {
             journalctl -u containerd > /tmp/containerd.log
+            cat /tmp/containerd.log
             systemctl stop containerd
         }
         selinux=$(getenforce)
@@ -253,34 +328,7 @@ EOF
         fi
         trap cleanup EXIT
         ctr version
-        critest --parallel=$(nproc) --report-dir="${REPORT_DIR}" --ginkgo.skip='HostIpc is true'
-    SHELL
-  end
-
-  # Rootless Podman is used for testing CRI-in-UserNS
-  # (We could use rootless nerdctl, but we are using Podman here because it is available in dnf)
-  config.vm.provision "install-rootless-podman", type: "shell", run: "never" do |sh|
-    sh.upload_path = "/tmp/vagrant-install-rootless-podman"
-    sh.inline = <<~SHELL
-        #!/usr/bin/env bash
-        set -eux -o pipefail
-        # Delegate cgroup v2 controllers to rootless
-        mkdir -p /etc/systemd/system/user@.service.d
-        cat > /etc/systemd/system/user@.service.d/delegate.conf << EOF
-[Service]
-Delegate=yes
-EOF
-        systemctl daemon-reload
-        # Install Podman
-        dnf install -y podman
-        # Configure Podman to resolve `golang` to `docker.io/library/golang`
-        mkdir -p /etc/containers
-        cat > /etc/containers/registries.conf <<EOF
-[registries.search]
-registries = ['docker.io']
-EOF
-        # Disable SELinux to allow overlayfs
-        setenforce 0
+        critest --parallel=$[$(nproc)+2] --ginkgo.skip='HostIpc is true' --report-dir="${REPORT_DIR}"
     SHELL
   end
 

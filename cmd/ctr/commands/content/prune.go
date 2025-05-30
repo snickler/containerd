@@ -21,12 +21,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/log"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/log"
+	"github.com/urfave/cli/v2"
 )
 
 const (
@@ -35,43 +34,43 @@ const (
 )
 
 var pruneFlags = []cli.Flag{
-	cli.BoolFlag{
+	&cli.BoolFlag{
 		Name:  "async",
-		Usage: "allow garbage collection to cleanup asynchronously",
+		Usage: "Allow garbage collection to cleanup asynchronously",
 	},
-	cli.BoolFlag{
+	&cli.BoolFlag{
 		Name:  "dry",
-		Usage: "just show updates without applying (enables debug logging)",
+		Usage: "Just show updates without applying (enables debug logging)",
 	},
 }
 
-var pruneCommand = cli.Command{
+var pruneCommand = &cli.Command{
 	Name:  "prune",
-	Usage: "prunes content from the content store",
+	Usage: "Prunes content from the content store",
 	Subcommands: cli.Commands{
 		pruneReferencesCommand,
 	},
 }
 
-var pruneReferencesCommand = cli.Command{
+var pruneReferencesCommand = &cli.Command{
 	Name:  "references",
-	Usage: "prunes preference labels from the content store (layers only by default)",
+	Usage: "Prunes preference labels from the content store (layers only by default)",
 	Flags: pruneFlags,
-	Action: func(clicontext *cli.Context) error {
-		client, ctx, cancel, err := commands.NewClient(clicontext)
+	Action: func(cliContext *cli.Context) error {
+		client, ctx, cancel, err := commands.NewClient(cliContext)
 		if err != nil {
 			return err
 		}
 		defer cancel()
 
-		dryRun := clicontext.Bool("dry")
+		dryRun := cliContext.Bool("dry")
 		if dryRun {
-			log.G(ctx).Logger.SetLevel(logrus.DebugLevel)
+			log.G(ctx).Logger.SetLevel(log.DebugLevel)
 			log.G(ctx).Debug("dry run, no changes will be applied")
 		}
 
 		var deleteOpts []leases.DeleteOpt
-		if !clicontext.Bool("async") {
+		if !cliContext.Bool("async") {
 			deleteOpts = append(deleteOpts, leases.SynchronousDelete)
 		}
 
@@ -81,7 +80,7 @@ var pruneReferencesCommand = cli.Command{
 
 			for k := range info.Labels {
 				if isLayerLabel(k) {
-					log.G(ctx).WithFields(logrus.Fields{
+					log.G(ctx).WithFields(log.Fields{
 						"digest": info.Digest,
 						"label":  k,
 					}).Debug("Removing label")

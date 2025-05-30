@@ -20,32 +20,32 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http/httptrace"
 	"os"
 	"sync"
 	"text/tabwriter"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/pkg/progress"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/pkg/httpdbg"
+	"github.com/containerd/containerd/v2/pkg/progress"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
 
-var fetchCommand = cli.Command{
+var fetchCommand = &cli.Command{
 	Name:      "fetch",
-	Usage:     "fetch all content for an image into containerd",
+	Usage:     "Fetch all content for an image into containerd",
 	ArgsUsage: "[flags] <remote> <object>",
 	Description: `Fetch an image into containerd.
-	
+
 This command ensures that containerd has all the necessary resources to build
 an image's rootfs and convert the configuration to a runtime format supported
 by containerd.
@@ -59,33 +59,38 @@ content and snapshots ready for a direct use via the 'ctr run'.
 
 Most of this is experimental and there are few leaps to make this work.`,
 	Flags: append(commands.RegistryFlags, commands.LabelFlag,
-		cli.StringSliceFlag{
+		&cli.StringSliceFlag{
 			Name:  "platform",
 			Usage: "Pull content from a specific platform",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "all-platforms",
-			Usage: "pull content from all platforms",
+			Usage: "Pull content from all platforms",
 		},
-		cli.BoolFlag{
-			Name:  "all-metadata",
-			Usage: "Pull metadata for all platforms",
+		&cli.BoolFlag{
+			Name:   "all-metadata",
+			Usage:  "(Deprecated: use skip-metadata) Pull metadata for all platforms",
+			Hidden: true,
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
+			Name:  "skip-metadata",
+			Usage: "Skips metadata for unused platforms (Image may be unable to be pushed without metadata)",
+		},
+		&cli.BoolFlag{
 			Name:  "metadata-only",
 			Usage: "Pull all metadata including manifests and configs",
 		},
 	),
-	Action: func(clicontext *cli.Context) error {
+	Action: func(cliContext *cli.Context) error {
 		var (
-			ref = clicontext.Args().First()
+			ref = cliContext.Args().First()
 		)
-		client, ctx, cancel, err := commands.NewClient(clicontext)
+		client, ctx, cancel, err := commands.NewClient(cliContext)
 		if err != nil {
 			return err
 		}
 		defer cancel()
-		config, err := NewFetchConfig(ctx, clicontext)
+		config, err := NewFetchConfig(ctx, cliContext)
 		if err != nil {
 			return err
 		}
@@ -116,42 +121,37 @@ type FetchConfig struct {
 }
 
 // NewFetchConfig returns the default FetchConfig from cli flags
-func NewFetchConfig(ctx context.Context, clicontext *cli.Context) (*FetchConfig, error) {
-	resolver, err := commands.GetResolver(ctx, clicontext)
+func NewFetchConfig(ctx context.Context, cliContext *cli.Context) (*FetchConfig, error) {
+	resolver, err := commands.GetResolver(ctx, cliContext)
 	if err != nil {
 		return nil, err
 	}
 	config := &FetchConfig{
 		Resolver:  resolver,
-		Labels:    clicontext.StringSlice("label"),
-		TraceHTTP: clicontext.Bool("http-trace"),
+		Labels:    cliContext.StringSlice("label"),
+		TraceHTTP: cliContext.Bool("http-trace"),
 	}
-	if !clicontext.GlobalBool("debug") {
+	if !cliContext.Bool("debug") {
 		config.ProgressOutput = os.Stdout
 	}
-	if !clicontext.Bool("all-platforms") {
-		p := clicontext.StringSlice("platform")
+	if !cliContext.Bool("all-platforms") {
+		p := cliContext.StringSlice("platform")
 		if len(p) == 0 {
 			p = append(p, platforms.DefaultString())
 		}
 		config.Platforms = p
 	}
 
-	if clicontext.Bool("metadata-only") {
+	if cliContext.Bool("metadata-only") {
 		config.AllMetadata = true
 		// Any with an empty set is None
 		config.PlatformMatcher = platforms.Any()
-	} else if clicontext.Bool("all-metadata") {
+	} else if !cliContext.Bool("skip-metadata") {
 		config.AllMetadata = true
 	}
 
-	if clicontext.IsSet("max-concurrent-downloads") {
-		mcd := clicontext.Int("max-concurrent-downloads")
-		config.RemoteOpts = append(config.RemoteOpts, containerd.WithMaxConcurrentDownloads(mcd))
-	}
-
-	if clicontext.IsSet("max-concurrent-uploaded-layers") {
-		mcu := clicontext.Int("max-concurrent-uploaded-layers")
+	if cliContext.IsSet("max-concurrent-uploaded-layers") {
+		mcu := cliContext.Int("max-concurrent-uploaded-layers")
 		config.RemoteOpts = append(config.RemoteOpts, containerd.WithMaxConcurrentUploadedLayers(mcu))
 	}
 
@@ -163,7 +163,7 @@ func Fetch(ctx context.Context, client *containerd.Client, ref string, config *F
 	ongoing := NewJobs(ref)
 
 	if config.TraceHTTP {
-		ctx = httptrace.WithClientTrace(ctx, commands.NewDebugClientTrace(ctx))
+		ctx = httpdbg.WithClientTrace(ctx)
 	}
 
 	pctx, stopProgress := context.WithCancel(ctx)
@@ -178,9 +178,7 @@ func Fetch(ctx context.Context, client *containerd.Client, ref string, config *F
 	}()
 
 	h := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		if desc.MediaType != images.MediaTypeDockerSchema1Manifest {
-			ongoing.Add(desc)
-		}
+		ongoing.Add(desc)
 		return nil, nil
 	})
 
@@ -190,7 +188,6 @@ func Fetch(ctx context.Context, client *containerd.Client, ref string, config *F
 		containerd.WithPullLabels(labels),
 		containerd.WithResolver(config.Resolver),
 		containerd.WithImageHandler(h),
-		containerd.WithSchema1Conversion,
 	}
 	opts = append(opts, config.RemoteOpts...)
 
@@ -236,9 +233,9 @@ outer:
 
 			tw := tabwriter.NewWriter(fw, 1, 8, 1, ' ', 0)
 
-			resolved := "resolved"
+			resolved := StatusResolved
 			if !ongoing.IsResolved() {
-				resolved = "resolving"
+				resolved = StatusResolving
 			}
 			statuses[ongoing.name] = StatusInfo{
 				Ref:    ongoing.name,
@@ -257,7 +254,7 @@ outer:
 				for _, active := range active {
 					statuses[active.Ref] = StatusInfo{
 						Ref:       active.Ref,
-						Status:    "downloading",
+						Status:    StatusDownloading,
 						Offset:    active.Offset,
 						Total:     active.Total,
 						StartedAt: active.StartedAt,
@@ -276,22 +273,22 @@ outer:
 				}
 
 				status, ok := statuses[key]
-				if !done && (!ok || status.Status == "downloading") {
+				if !done && (!ok || status.Status == StatusDownloading) {
 					info, err := cs.Info(ctx, j.Digest)
 					if err != nil {
 						if !errdefs.IsNotFound(err) {
-							log.G(ctx).WithError(err).Errorf("failed to get content info")
+							log.G(ctx).WithError(err).Error("failed to get content info")
 							continue outer
 						} else {
 							statuses[key] = StatusInfo{
 								Ref:    key,
-								Status: "waiting",
+								Status: StatusWaiting,
 							}
 						}
 					} else if info.CreatedAt.After(start) {
 						statuses[key] = StatusInfo{
 							Ref:       key,
-							Status:    "done",
+							Status:    StatusDone,
 							Offset:    info.Size,
 							Total:     info.Size,
 							UpdatedAt: info.CreatedAt,
@@ -299,19 +296,19 @@ outer:
 					} else {
 						statuses[key] = StatusInfo{
 							Ref:    key,
-							Status: "exists",
+							Status: StatusExists,
 						}
 					}
 				} else if done {
 					if ok {
-						if status.Status != "done" && status.Status != "exists" {
-							status.Status = "done"
+						if status.Status != StatusDone && status.Status != StatusExists {
+							status.Status = StatusDone
 							statuses[key] = status
 						}
 					} else {
 						statuses[key] = StatusInfo{
 							Ref:    key,
-							Status: "done",
+							Status: StatusDone,
 						}
 					}
 				}
@@ -385,10 +382,24 @@ func (j *Jobs) IsResolved() bool {
 	return j.resolved
 }
 
+// StatusInfoStatus describes status info for an upload or download.
+type StatusInfoStatus string
+
+const (
+	StatusResolved    StatusInfoStatus = "resolved"
+	StatusResolving   StatusInfoStatus = "resolving"
+	StatusWaiting     StatusInfoStatus = "waiting"
+	StatusCommitting  StatusInfoStatus = "committing"
+	StatusDone        StatusInfoStatus = "done"
+	StatusDownloading StatusInfoStatus = "downloading"
+	StatusUploading   StatusInfoStatus = "uploading"
+	StatusExists      StatusInfoStatus = "exists"
+)
+
 // StatusInfo holds the status info for an upload or download
 type StatusInfo struct {
 	Ref       string
-	Status    string
+	Status    StatusInfoStatus
 	Offset    int64
 	Total     int64
 	StartedAt time.Time
@@ -401,7 +412,7 @@ func Display(w io.Writer, statuses []StatusInfo, start time.Time) {
 	for _, status := range statuses {
 		total += status.Offset
 		switch status.Status {
-		case "downloading", "uploading":
+		case StatusDownloading, StatusUploading:
 			var bar progress.Bar
 			if status.Total > 0.0 {
 				bar = progress.Bar(float64(status.Offset) / float64(status.Total))
@@ -411,7 +422,7 @@ func Display(w io.Writer, statuses []StatusInfo, start time.Time) {
 				status.Status,
 				bar,
 				progress.Bytes(status.Offset), progress.Bytes(status.Total))
-		case "resolving", "waiting":
+		case StatusResolving, StatusWaiting:
 			bar := progress.Bar(0.0)
 			fmt.Fprintf(w, "%s:\t%s\t%40r\t\n",
 				status.Ref,

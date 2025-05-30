@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
    Copyright The containerd Authors.
@@ -19,37 +19,156 @@
 package client
 
 import (
+	"context"
+	"strings"
+	"sync"
 	"testing"
 
-	. "github.com/containerd/containerd"
-	"github.com/containerd/containerd/platforms"
-)
-
-const (
-	defaultRoot    = "/var/lib/containerd-test"
-	defaultState   = "/run/containerd-test"
-	defaultAddress = "/run/containerd-test/containerd.sock"
+	"github.com/containerd/containerd/api/services/tasks/v1"
+	"github.com/containerd/containerd/api/types/runc/options"
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/integration/images"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/typeurl/v2"
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 var (
-	testImage    = "mirror.gcr.io/library/busybox:1.32"
-	shortCommand = withProcessArgs("true")
-	longCommand  = withProcessArgs("/bin/sh", "-c", "while true; do sleep 1; done")
+	testImage             = images.Get(images.BusyBox)
+	testMultiLayeredImage = images.Get(images.VolumeCopyUp)
+	shortCommand          = withProcessArgs("true")
+	// NOTE: The TestContainerPids needs two running processes in one
+	// container. But busybox:1.36 sh shell, the `sleep` is a builtin.
+	//
+	// 	/bin/sh -c "type sleep"
+	//      sleep is a shell builtin
+	//
+	// We should use `/bin/sleep` instead of `sleep`. And busybox sh shell
+	// will execve directly instead of clone-execve if there is only one
+	// command. There will be only one process in container if we use
+	// '/bin/sh -c "/bin/sleep inf"'.
+	//
+	// So we append `&& exit 0` to force sh shell uses clone-execve.
+	longCommand = withProcessArgs("/bin/sh", "-c", "/bin/sleep inf && exit 0")
 )
 
-func TestImagePullSchema1WithEmptyLayers(t *testing.T) {
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
+func TestNewTaskWithRuntimeOption(t *testing.T) {
+	t.Parallel()
 
-	ctx, cancel := testContext(t)
+	fakeTasks := &fakeTaskService{
+		TasksClient:    tasks.NewTasksClient(nil),
+		createRequests: map[string]*tasks.CreateTaskRequest{},
+	}
+
+	cli, err := newClient(t, address,
+		WithServices(WithTaskClient(fakeTasks)),
+	)
+	require.NoError(t, err)
+	defer cli.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+	)
 	defer cancel()
 
-	schema1TestImageWithEmptyLayers := "gcr.io/google-containers/busybox@sha256:d8d3bc2c183ed2f9f10e7258f84971202325ee6011ba137112e01e30f206de67"
-	_, err = client.Pull(ctx, schema1TestImageWithEmptyLayers, WithPlatform(platforms.DefaultString()), WithSchema1Conversion, WithPullUnpack)
-	if err != nil {
-		t.Fatal(err)
+	image, err = cli.GetImage(ctx, testImage)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name            string
+		runtimeOption   *options.Options
+		taskOpts        []NewTaskOpts
+		expectedOptions *options.Options
+	}{
+		{
+			name: "should be empty options",
+			runtimeOption: &options.Options{
+				BinaryName: "no-runc",
+			},
+			expectedOptions: nil,
+		},
+		{
+			name: "should overwrite IOUid/ShimCgroup",
+			runtimeOption: &options.Options{
+				BinaryName:    "no-runc",
+				ShimCgroup:    "/abc",
+				IoUid:         1000,
+				SystemdCgroup: true,
+			},
+			taskOpts: []NewTaskOpts{
+				WithUIDOwner(2000),
+				WithGIDOwner(3000),
+				WithShimCgroup("/def"),
+			},
+			expectedOptions: &options.Options{
+				BinaryName:    "no-runc",
+				ShimCgroup:    "/def",
+				IoUid:         2000,
+				IoGid:         3000,
+				SystemdCgroup: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := strings.Replace(t.Name(), "/", "_", -1)
+
+			container, err := cli.NewContainer(
+				ctx,
+				id,
+				WithNewSnapshotView(id, image),
+				WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)),
+				WithRuntime(plugins.RuntimeRuncV2, tc.runtimeOption),
+			)
+			require.NoError(t, err)
+			defer container.Delete(ctx, WithSnapshotCleanup)
+
+			_, err = container.NewTask(ctx, empty(), tc.taskOpts...)
+			require.NoError(t, err)
+
+			fakeTasks.Lock()
+			req := fakeTasks.createRequests[id]
+			fakeTasks.Unlock()
+
+			if tc.expectedOptions == nil {
+				require.Nil(t, req.Options)
+				return
+			}
+
+			gotOptions := &options.Options{}
+			require.NoError(t, typeurl.UnmarshalTo(req.Options, gotOptions))
+			require.True(t, cmp.Equal(tc.expectedOptions, gotOptions, protobuf.Compare))
+		})
 	}
+}
+
+type fakeTaskService struct {
+	sync.Mutex
+	createRequests map[string]*tasks.CreateTaskRequest
+	tasks.TasksClient
+}
+
+func (ts *fakeTaskService) Create(ctx context.Context, in *tasks.CreateTaskRequest, opts ...grpc.CallOption) (*tasks.CreateTaskResponse, error) {
+	ts.Lock()
+	defer ts.Unlock()
+
+	ts.createRequests[in.ContainerID] = in
+	return &tasks.CreateTaskResponse{
+		ContainerID: in.ContainerID,
+		Pid:         1,
+	}, nil
+}
+
+func (ts *fakeTaskService) Get(ctx context.Context, in *tasks.GetRequest, opts ...grpc.CallOption) (*tasks.GetResponse, error) {
+	return nil, errgrpc.ToGRPC(errdefs.ErrNotFound)
+}
+
+func (ts *fakeTaskService) Delete(ctx context.Context, in *tasks.DeleteTaskRequest, opts ...grpc.CallOption) (*tasks.DeleteResponse, error) {
+	return nil, errgrpc.ToGRPC(errdefs.ErrNotFound)
 }

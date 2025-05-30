@@ -17,36 +17,36 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/mount"
-	"github.com/pkg/errors"
-	"github.com/urfave/cli"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/errdefs"
+	"github.com/urfave/cli/v2"
 )
 
-var unmountCommand = cli.Command{
+var unmountCommand = &cli.Command{
 	Name:        "unmount",
-	Usage:       "unmount the image from the target",
+	Usage:       "Unmount the image from the target",
 	ArgsUsage:   "[flags] <target>",
 	Description: "Unmount the image rootfs from the specified target.",
 	Flags: append(append(commands.RegistryFlags, append(commands.SnapshotterFlags, commands.LabelFlag)...),
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "rm",
-			Usage: "remove the snapshot after a successful unmount",
+			Usage: "Remove the snapshot after a successful unmount",
 		},
 	),
-	Action: func(context *cli.Context) error {
+	Action: func(cliContext *cli.Context) error {
 		var (
-			target = context.Args().First()
+			target = cliContext.Args().First()
 		)
 		if target == "" {
-			return fmt.Errorf("please provide a target path to unmount from")
+			return errors.New("please provide a target path to unmount from")
 		}
 
-		client, ctx, cancel, err := commands.NewClient(context)
+		client, ctx, cancel, err := commands.NewClient(cliContext)
 		if err != nil {
 			return err
 		}
@@ -56,18 +56,18 @@ var unmountCommand = cli.Command{
 			return err
 		}
 
-		if context.Bool("rm") {
-			snapshotter := context.String("snapshotter")
+		if cliContext.Bool("rm") {
+			snapshotter := cliContext.String("snapshotter")
 			s := client.SnapshotService(snapshotter)
 			if err := client.LeasesService().Delete(ctx, leases.Lease{ID: target}); err != nil && !errdefs.IsNotFound(err) {
-				return errors.Wrap(err, "error deleting lease")
+				return fmt.Errorf("error deleting lease: %w", err)
 			}
 			if err := s.Remove(ctx, target); err != nil && !errdefs.IsNotFound(err) {
-				return errors.Wrap(err, "error removing snapshot")
+				return fmt.Errorf("error removing snapshot: %w", err)
 			}
 		}
 
-		fmt.Fprintln(context.App.Writer, target)
+		fmt.Fprintln(cliContext.App.Writer, target)
 		return nil
 	},
 }

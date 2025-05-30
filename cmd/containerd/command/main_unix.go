@@ -1,4 +1,4 @@
-// +build linux darwin freebsd solaris
+//go:build linux || darwin || freebsd || solaris
 
 /*
    Copyright The containerd Authors.
@@ -23,8 +23,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/services/server"
+	"github.com/containerd/containerd/v2/cmd/containerd/server"
+	"github.com/containerd/log"
 	"golang.org/x/sys/unix"
 )
 
@@ -35,7 +35,7 @@ var handledSignals = []os.Signal{
 	unix.SIGPIPE,
 }
 
-func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *server.Server) chan struct{} {
+func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *server.Server, cancel func()) chan struct{} {
 	done := make(chan struct{}, 1)
 	go func() {
 		var server *server.Server
@@ -45,7 +45,7 @@ func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *se
 				server = s
 			case s := <-signals:
 
-				// Do not print message when deailing with SIGPIPE, which may cause
+				// Do not print message when dealing with SIGPIPE, which may cause
 				// nested signals and consume lots of cpu bandwidth.
 				if s == unix.SIGPIPE {
 					continue
@@ -60,11 +60,10 @@ func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *se
 						log.G(ctx).WithError(err).Error("notify stopping failed")
 					}
 
-					if server == nil {
-						close(done)
-						return
+					cancel()
+					if server != nil {
+						server.Stop()
 					}
-					server.Stop()
 					close(done)
 					return
 				}

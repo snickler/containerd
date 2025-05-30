@@ -13,9 +13,12 @@ import (
 	"time"
 
 	"github.com/Microsoft/hcsshim/ext4/internal/format"
+	"github.com/Microsoft/hcsshim/internal/memory"
 )
 
 // Writer writes a compact ext4 file system.
+//
+// It expects all paths to use directory separator '/', even on Windows.
 type Writer struct {
 	f                    io.ReadWriteSeeker
 	bw                   *bufio.Writer
@@ -95,21 +98,21 @@ const (
 	inodeFirst        = 11
 	inodeLostAndFound = inodeFirst
 
-	blockSize               = 4096
-	blocksPerGroup          = blockSize * 8
+	BlockSize               = 4096
+	blocksPerGroup          = BlockSize * 8
 	inodeSize               = 256
-	maxInodesPerGroup       = blockSize * 8 // Limited by the inode bitmap
-	inodesPerGroupIncrement = blockSize / inodeSize
+	maxInodesPerGroup       = BlockSize * 8 // Limited by the inode bitmap
+	inodesPerGroupIncrement = BlockSize / inodeSize
 
-	defaultMaxDiskSize = 16 * 1024 * 1024 * 1024        // 16GB
+	defaultMaxDiskSize = 16 * memory.GiB                // 16GB
 	maxMaxDiskSize     = 16 * 1024 * 1024 * 1024 * 1024 // 16TB
 
 	groupDescriptorSize      = 32 // Use the small group descriptor
-	groupsPerDescriptorBlock = blockSize / groupDescriptorSize
+	groupsPerDescriptorBlock = BlockSize / groupDescriptorSize
 
-	maxFileSize             = 128 * 1024 * 1024 * 1024 // 128GB file size maximum for now
-	smallSymlinkSize        = 59                       // max symlink size that goes directly in the inode
-	maxBlocksPerExtent      = 0x8000                   // maximum number of blocks in an extent
+	maxFileSize             = 128 * memory.GiB // 128GB file size maximum for now
+	smallSymlinkSize        = 59               // max symlink size that goes directly in the inode
+	maxBlocksPerExtent      = 0x8000           // maximum number of blocks in an extent
 	inodeDataSize           = 60
 	inodeUsedSize           = 152 // fields through CrtimeExtra
 	inodeExtraSize          = inodeSize - inodeUsedSize
@@ -252,7 +255,7 @@ type xattrState struct {
 
 func (s *xattrState) init() {
 	s.inodeLeft = inodeExtraSize - xattrInodeOverhead
-	s.blockLeft = blockSize - xattrBlockOverhead
+	s.blockLeft = BlockSize - xattrBlockOverhead
 }
 
 func (s *xattrState) addXattr(name string, value []byte) bool {
@@ -331,7 +334,7 @@ func (w *Writer) writeXattrs(inode *inode, state *xattrState) error {
 				state.block[i].Name < state.block[j].Name
 		})
 
-		var b [blockSize]byte
+		var b [BlockSize]byte
 		binary.LittleEndian.PutUint32(b[0:], format.XAttrHeaderMagic) // Magic
 		binary.LittleEndian.PutUint32(b[4:], 1)                       // ReferenceCount
 		binary.LittleEndian.PutUint32(b[8:], 1)                       // Blocks
@@ -414,6 +417,15 @@ func (w *Writer) makeInode(f *File, node *inode) (*inode, error) {
 	node.Devmajor = f.Devmajor
 	node.Devminor = f.Devminor
 	node.Data = nil
+	if f.Xattrs == nil {
+		f.Xattrs = make(map[string][]byte)
+	}
+
+	// copy over existing xattrs first, we need to merge existing xattrs and the passed xattrs.
+	existingXattrs := make(map[string][]byte)
+	if len(node.XattrInline) > 0 {
+		getXattrs(node.XattrInline[4:], existingXattrs, 0)
+	}
 	node.XattrInline = nil
 
 	var xstate xattrState
@@ -450,6 +462,13 @@ func (w *Writer) makeInode(f *File, node *inode) (*inode, error) {
 	case format.S_IFDIR, format.S_IFIFO, format.S_IFSOCK, format.S_IFCHR, format.S_IFBLK:
 	default:
 		return nil, fmt.Errorf("invalid mode %o", mode)
+	}
+
+	// merge xattrs but prefer currently passed over existing
+	for name, data := range existingXattrs {
+		if _, ok := f.Xattrs[name]; !ok {
+			f.Xattrs[name] = data
+		}
 	}
 
 	// Accumulate the extended attributes.
@@ -514,15 +533,17 @@ func (w *Writer) lookup(name string, mustExist bool) (*inode, *inode, string, er
 	return dir, child, childname, nil
 }
 
-// CreateWithParents adds a file to the file system creating the parent directories in the path if
-// they don't exist (like `mkdir -p`). These non existing parent directories are created
+// MakeParents ensures that all the parent directories in the path specified by `name` exists. If
+// they don't exist it creates them (like `mkdir -p`). These non existing parent directories are created
 // with the same permissions as that of it's parent directory. It is expected that the a
 // call to make these parent directories will be made at a later point with the correct
 // permissions, at that time the permissions of these directories will be updated.
-func (w *Writer) CreateWithParents(name string, f *File) error {
+// We treat Atime, Mtime, Ctime, and Crtime in the same way.
+func (w *Writer) MakeParents(name string) error {
 	if err := w.finishInode(); err != nil {
 		return err
 	}
+
 	// go through the directories in the path one by one and create the
 	// parent directories if they don't exist.
 	cleanname := path.Clean("/" + name)[1:]
@@ -536,10 +557,10 @@ func (w *Writer) CreateWithParents(name string, f *File) error {
 		if _, ok := root.Children[dirname]; !ok {
 			f := &File{
 				Mode:     root.Mode,
-				Atime:    time.Now(),
-				Mtime:    time.Now(),
-				Ctime:    time.Now(),
-				Crtime:   time.Now(),
+				Atime:    fsTimeToTime(root.Atime),
+				Mtime:    fsTimeToTime(root.Mtime),
+				Ctime:    fsTimeToTime(root.Ctime),
+				Crtime:   fsTimeToTime(root.Crtime),
 				Size:     0,
 				Uid:      root.Uid,
 				Gid:      root.Gid,
@@ -553,7 +574,7 @@ func (w *Writer) CreateWithParents(name string, f *File) error {
 		}
 		root = root.Children[dirname]
 	}
-	return w.Create(name, f)
+	return nil
 }
 
 // Create adds a file to the file system.
@@ -584,7 +605,7 @@ func (w *Writer) Create(name string, f *File) error {
 	}
 	child, err := w.makeInode(f, reuse)
 	if err != nil {
-		return fmt.Errorf("%s: %s", name, err)
+		return fmt.Errorf("%s: %w", name, err)
 	}
 	if existing != child {
 		if existing != nil {
@@ -603,6 +624,8 @@ func (w *Writer) Create(name string, f *File) error {
 }
 
 // Link adds a hard link to the file system.
+// We support creating hardlinks to symlinks themselves instead of what
+// the symlinks link to, as this is what containerd does upstream.
 func (w *Writer) Link(oldname, newname string) error {
 	if err := w.finishInode(); err != nil {
 		return err
@@ -620,8 +643,8 @@ func (w *Writer) Link(oldname, newname string) error {
 		return err
 	}
 	switch oldfile.Mode & format.TypeMask {
-	case format.S_IFDIR, format.S_IFLNK:
-		return fmt.Errorf("%s: link target cannot be a directory or symlink: %s", newname, oldname)
+	case format.S_IFDIR:
+		return fmt.Errorf("%s: link target cannot be a directory: %s", newname, oldname)
 	}
 
 	if existing != oldfile && oldfile.LinkCount >= format.MaxLinks {
@@ -665,7 +688,7 @@ func (w *Writer) Stat(name string) (*File, error) {
 			if w.err != nil {
 				return nil, w.err
 			}
-			var b [blockSize]byte
+			var b [BlockSize]byte
 			_, err := w.f.Read(b[:])
 			w.seekBlock(orig)
 			if err != nil {
@@ -717,11 +740,11 @@ func (w *Writer) startInode(name string, inode *inode, size int64) {
 }
 
 func (w *Writer) block() uint32 {
-	return uint32(w.pos / blockSize)
+	return uint32(w.pos / BlockSize)
 }
 
 func (w *Writer) seekBlock(block uint32) {
-	w.pos = int64(block) * blockSize
+	w.pos = int64(block) * BlockSize
 	if w.err != nil {
 		return
 	}
@@ -733,9 +756,9 @@ func (w *Writer) seekBlock(block uint32) {
 }
 
 func (w *Writer) nextBlock() {
-	if w.pos%blockSize != 0 {
+	if w.pos%BlockSize != 0 {
 		// Simplify callers; w.err is updated on failure.
-		_, _ = w.zero(blockSize - w.pos%blockSize)
+		_, _ = w.zero(BlockSize - w.pos%BlockSize)
 	}
 }
 
@@ -763,17 +786,17 @@ func fillExtents(hdr *format.ExtentHeader, extents []format.ExtentLeafNode, star
 
 func (w *Writer) writeExtents(inode *inode) error {
 	start := w.pos - w.dataWritten
-	if start%blockSize != 0 {
+	if start%BlockSize != 0 {
 		panic("unaligned")
 	}
 	w.nextBlock()
 
-	startBlock := uint32(start / blockSize)
+	startBlock := uint32(start / BlockSize)
 	blocks := w.block() - startBlock
 	usedBlocks := blocks
 
 	const extentNodeSize = 12
-	const extentsPerBlock = blockSize/extentNodeSize - 1
+	const extentsPerBlock = BlockSize/extentNodeSize - 1
 
 	extents := (blocks + maxBlocksPerExtent - 1) / maxBlocksPerExtent
 	var b bytes.Buffer
@@ -787,7 +810,7 @@ func (w *Writer) writeExtents(inode *inode) error {
 		fillExtents(&root.hdr, root.extents[:extents], startBlock, 0, blocks)
 		_ = binary.Write(&b, binary.LittleEndian, root)
 	} else if extents <= 4*extentsPerBlock {
-		const extentsPerBlock = blockSize/extentNodeSize - 1
+		const extentsPerBlock = BlockSize/extentNodeSize - 1
 		extentBlocks := extents/extentsPerBlock + 1
 		usedBlocks += extentBlocks
 		var b2 bytes.Buffer
@@ -815,13 +838,13 @@ func (w *Writer) writeExtents(inode *inode) error {
 			var node struct {
 				hdr     format.ExtentHeader
 				extents [extentsPerBlock]format.ExtentLeafNode
-				_       [blockSize - (extentsPerBlock+1)*extentNodeSize]byte
+				_       [BlockSize - (extentsPerBlock+1)*extentNodeSize]byte
 			}
 
 			offset := i * extentsPerBlock * maxBlocksPerExtent
 			fillExtents(&node.hdr, node.extents[:extentsInBlock], startBlock+offset, offset, blocks)
 			_ = binary.Write(&b2, binary.LittleEndian, node)
-			if _, err := w.write(b2.Next(blockSize)); err != nil {
+			if _, err := w.write(b2.Next(BlockSize)); err != nil {
 				return err
 			}
 		}
@@ -900,7 +923,7 @@ func (w *Writer) writeDirectory(dir, parent *inode) error {
 
 	// The size of the directory is not known yet.
 	w.startInode("", dir, 0x7fffffffffffffff)
-	left := blockSize
+	left := BlockSize
 	finishBlock := func() error {
 		if left > 0 {
 			e := format.DirectoryEntry{
@@ -919,7 +942,7 @@ func (w *Writer) writeDirectory(dir, parent *inode) error {
 				return err
 			}
 		}
-		left = blockSize
+		left = BlockSize
 		return nil
 	}
 
@@ -1082,7 +1105,7 @@ func (w *Writer) writeInodeTable(tableSize uint32) error {
 }
 
 // NewWriter returns a Writer that writes an ext4 file system to the provided
-// WriteSeeker.
+// ReadWriteSeeker.
 func NewWriter(f io.ReadWriteSeeker, opts ...Option) *Writer {
 	w := &Writer{
 		f:           f,
@@ -1114,7 +1137,7 @@ func MaximumDiskSize(size int64) Option {
 		} else if size == 0 {
 			w.maxDiskSize = defaultMaxDiskSize
 		} else {
-			w.maxDiskSize = (size + blockSize - 1) &^ (blockSize - 1)
+			w.maxDiskSize = (size + BlockSize - 1) &^ (BlockSize - 1)
 		}
 	}
 }
@@ -1129,7 +1152,7 @@ func (w *Writer) init() error {
 	root.LinkCount++ // The root is linked to itself.
 	// Skip until the first non-reserved inode.
 	w.inodes = append(w.inodes, make([]*inode, inodeFirst-len(w.inodes)-1)...)
-	maxBlocks := (w.maxDiskSize-1)/blockSize + 1
+	maxBlocks := (w.maxDiskSize-1)/BlockSize + 1
 	maxGroups := (maxBlocks-1)/blocksPerGroup + 1
 	w.gdBlocks = uint32((maxGroups-1)/groupsPerDescriptorBlock + 1)
 
@@ -1145,7 +1168,7 @@ func (w *Writer) init() error {
 }
 
 func groupCount(blocks uint32, inodes uint32, inodesPerGroup uint32) uint32 {
-	inodeBlocksPerGroup := inodesPerGroup * inodeSize / blockSize
+	inodeBlocksPerGroup := inodesPerGroup * inodeSize / BlockSize
 	dataBlocksPerGroup := blocksPerGroup - inodeBlocksPerGroup - 2 // save room for the bitmaps
 
 	// Increase the block count to ensure there are enough groups for all the
@@ -1207,16 +1230,16 @@ func (w *Writer) Close() error {
 	}
 
 	gds := make([]format.GroupDescriptor, w.gdBlocks*groupsPerDescriptorBlock)
-	inodeTableSizePerGroup := inodesPerGroup * inodeSize / blockSize
+	inodeTableSizePerGroup := inodesPerGroup * inodeSize / BlockSize
 	var totalUsedBlocks, totalUsedInodes uint32
 	for g := uint32(0); g < groups; g++ {
-		var b [blockSize * 2]byte
+		var b [BlockSize * 2]byte
 		var dirCount, usedInodeCount, usedBlockCount uint16
 
 		// Block bitmap
 		if (g+1)*blocksPerGroup <= validDataSize {
 			// This group is fully allocated.
-			for j := range b[:blockSize] {
+			for j := range b[:BlockSize] {
 				b[j] = 0xff
 			}
 			usedBlockCount = blocksPerGroup
@@ -1246,7 +1269,7 @@ func (w *Writer) Close() error {
 			ino := format.InodeNumber(1 + g*inodesPerGroup + j)
 			inode := w.getInode(ino)
 			if ino < inodeFirst || inode != nil {
-				b[blockSize+j/8] |= 1 << (j % 8)
+				b[BlockSize+j/8] |= 1 << (j % 8)
 				usedInodeCount++
 			}
 			if inode != nil && inode.Mode&format.TypeMask == format.S_IFDIR {
@@ -1271,7 +1294,7 @@ func (w *Writer) Close() error {
 	}
 
 	// Zero up to the disk size.
-	_, err = w.zero(int64(diskSize-bitmapOffset-bitmapSize) * blockSize)
+	_, err = w.zero(int64(diskSize-bitmapOffset-bitmapSize) * BlockSize)
 	if err != nil {
 		return err
 	}
@@ -1287,7 +1310,7 @@ func (w *Writer) Close() error {
 	}
 
 	// Write the super block
-	var blk [blockSize]byte
+	var blk [BlockSize]byte
 	b := bytes.NewBuffer(blk[:1024])
 	sb := &format.SuperBlock{
 		InodesCount:        inodesPerGroup * groups,

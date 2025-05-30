@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -10,9 +11,31 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
+	"github.com/cilium/ebpf/internal/sys"
+	"github.com/cilium/ebpf/internal/unix"
 )
+
+// The *Info structs expose metadata about a program or map. Most
+// fields are exposed via a getter:
+//
+//     func (*MapInfo) ID() (MapID, bool)
+//
+// This is because the metadata available changes based on kernel version.
+// The second boolean return value indicates whether a particular field is
+// available on the current kernel.
+//
+// Always add new metadata as such a getter, unless you can somehow get the
+// value of the field on all supported kernels. Also document which version
+// a particular field first appeared in.
+//
+// Some metadata is a buffer which needs additional parsing. In this case,
+// store the undecoded data in the Info struct and provide a getter which
+// decodes it when necessary. See ProgramInfo.Instructions for an example.
 
 // MapInfo describes a map.
 type MapInfo struct {
@@ -22,12 +45,15 @@ type MapInfo struct {
 	ValueSize  uint32
 	MaxEntries uint32
 	Flags      uint32
-	// Name as supplied by user space at load time.
+	// Name as supplied by user space at load time. Available from 4.15.
 	Name string
+
+	btf btf.ID
 }
 
-func newMapInfoFromFd(fd *internal.FD) (*MapInfo, error) {
-	info, err := bpfGetMapInfoByFD(fd)
+func newMapInfoFromFd(fd *sys.FD) (*MapInfo, error) {
+	var info sys.MapInfo
+	err := sys.ObjInfo(fd, &info)
 	if errors.Is(err, syscall.EINVAL) {
 		return newMapInfoFromProc(fd)
 	}
@@ -36,18 +62,18 @@ func newMapInfoFromFd(fd *internal.FD) (*MapInfo, error) {
 	}
 
 	return &MapInfo{
-		MapType(info.map_type),
-		MapID(info.id),
-		info.key_size,
-		info.value_size,
-		info.max_entries,
-		info.map_flags,
-		// name is available from 4.15.
-		internal.CString(info.name[:]),
+		MapType(info.Type),
+		MapID(info.Id),
+		info.KeySize,
+		info.ValueSize,
+		info.MaxEntries,
+		uint32(info.MapFlags),
+		unix.ByteSliceToString(info.Name[:]),
+		btf.ID(info.BtfId),
 	}, nil
 }
 
-func newMapInfoFromProc(fd *internal.FD) (*MapInfo, error) {
+func newMapInfoFromProc(fd *sys.FD) (*MapInfo, error) {
 	var mi MapInfo
 	err := scanFdInfo(fd, map[string]interface{}{
 		"map_type":    &mi.Type,
@@ -71,28 +97,55 @@ func (mi *MapInfo) ID() (MapID, bool) {
 	return mi.id, mi.id > 0
 }
 
+// BTFID returns the BTF ID associated with the Map.
+//
+// The ID is only valid as long as the associated Map is kept alive.
+// Available from 4.18.
+//
+// The bool return value indicates whether this optional field is available and
+// populated. (The field may be available but not populated if the kernel
+// supports the field but the Map was loaded without BTF information.)
+func (mi *MapInfo) BTFID() (btf.ID, bool) {
+	return mi.btf, mi.btf > 0
+}
+
 // programStats holds statistics of a program.
 type programStats struct {
 	// Total accumulated runtime of the program ins ns.
 	runtime time.Duration
 	// Total number of times the program was called.
 	runCount uint64
+	// Total number of times the programm was NOT called.
+	// Added in commit 9ed9e9ba2337 ("bpf: Count the number of times recursion was prevented").
+	recursionMisses uint64
 }
 
 // ProgramInfo describes a program.
 type ProgramInfo struct {
 	Type ProgramType
 	id   ProgramID
-	// Truncated hash of the BPF bytecode.
+	// Truncated hash of the BPF bytecode. Available from 4.13.
 	Tag string
-	// Name as supplied by user space at load time.
+	// Name as supplied by user space at load time. Available from 4.15.
 	Name string
 
-	stats *programStats
+	createdByUID     uint32
+	haveCreatedByUID bool
+	btf              btf.ID
+	stats            *programStats
+
+	maps  []MapID
+	insns []byte
+
+	lineInfos    []byte
+	numLineInfos uint32
+	funcInfos    []byte
+	numFuncInfos uint32
 }
 
-func newProgramInfoFromFd(fd *internal.FD) (*ProgramInfo, error) {
-	info, err := bpfGetProgInfoByFD(fd)
+func newProgramInfoFromFd(fd *sys.FD) (*ProgramInfo, error) {
+	var info sys.ProgInfo
+	err := sys.ObjInfo(fd, &info)
 	if errors.Is(err, syscall.EINVAL) {
 		return newProgramInfoFromProc(fd)
 	}
@@ -100,21 +153,78 @@ func newProgramInfoFromFd(fd *internal.FD) (*ProgramInfo, error) {
 		return nil, err
 	}
 
-	return &ProgramInfo{
-		Type: ProgramType(info.prog_type),
-		id:   ProgramID(info.id),
-		// tag is available if the kernel supports BPF_PROG_GET_INFO_BY_FD.
-		Tag: hex.EncodeToString(info.tag[:]),
-		// name is available from 4.15.
-		Name: internal.CString(info.name[:]),
+	pi := ProgramInfo{
+		Type: ProgramType(info.Type),
+		id:   ProgramID(info.Id),
+		Tag:  hex.EncodeToString(info.Tag[:]),
+		Name: unix.ByteSliceToString(info.Name[:]),
+		btf:  btf.ID(info.BtfId),
 		stats: &programStats{
-			runtime:  time.Duration(info.run_time_ns),
-			runCount: info.run_cnt,
+			runtime:         time.Duration(info.RunTimeNs),
+			runCount:        info.RunCnt,
+			recursionMisses: info.RecursionMisses,
 		},
-	}, nil
+	}
+
+	// Start with a clean struct for the second call, otherwise we may get EFAULT.
+	var info2 sys.ProgInfo
+
+	makeSecondCall := false
+
+	if info.NrMapIds > 0 {
+		pi.maps = make([]MapID, info.NrMapIds)
+		info2.NrMapIds = info.NrMapIds
+		info2.MapIds = sys.NewPointer(unsafe.Pointer(&pi.maps[0]))
+		makeSecondCall = true
+	} else if haveProgramInfoMapIDs() == nil {
+		// This program really has no associated maps.
+		pi.maps = make([]MapID, 0)
+	} else {
+		// The kernel doesn't report associated maps.
+		pi.maps = nil
+	}
+
+	// createdByUID and NrMapIds were introduced in the same kernel version.
+	if pi.maps != nil {
+		pi.createdByUID = info.CreatedByUid
+		pi.haveCreatedByUID = true
+	}
+
+	if info.XlatedProgLen > 0 {
+		pi.insns = make([]byte, info.XlatedProgLen)
+		info2.XlatedProgLen = info.XlatedProgLen
+		info2.XlatedProgInsns = sys.NewSlicePointer(pi.insns)
+		makeSecondCall = true
+	}
+
+	if info.NrLineInfo > 0 {
+		pi.lineInfos = make([]byte, btf.LineInfoSize*info.NrLineInfo)
+		info2.LineInfo = sys.NewSlicePointer(pi.lineInfos)
+		info2.LineInfoRecSize = btf.LineInfoSize
+		info2.NrLineInfo = info.NrLineInfo
+		pi.numLineInfos = info.NrLineInfo
+		makeSecondCall = true
+	}
+
+	if info.NrFuncInfo > 0 {
+		pi.funcInfos = make([]byte, btf.FuncInfoSize*info.NrFuncInfo)
+		info2.FuncInfo = sys.NewSlicePointer(pi.funcInfos)
+		info2.FuncInfoRecSize = btf.FuncInfoSize
+		info2.NrFuncInfo = info.NrFuncInfo
+		pi.numFuncInfos = info.NrFuncInfo
+		makeSecondCall = true
+	}
+
+	if makeSecondCall {
+		if err := sys.ObjInfo(fd, &info2); err != nil {
+			return nil, err
+		}
+	}
+
+	return &pi, nil
 }
 
-func newProgramInfoFromProc(fd *internal.FD) (*ProgramInfo, error) {
+func newProgramInfoFromProc(fd *sys.FD) (*ProgramInfo, error) {
 	var info ProgramInfo
 	err := scanFdInfo(fd, map[string]interface{}{
 		"prog_type": &info.Type,
@@ -142,6 +252,27 @@ func (pi *ProgramInfo) ID() (ProgramID, bool) {
 	return pi.id, pi.id > 0
 }
 
+// CreatedByUID returns the Uid that created the program.
+//
+// Available from 4.15.
+//
+// The bool return value indicates whether this optional field is available.
+func (pi *ProgramInfo) CreatedByUID() (uint32, bool) {
+	return pi.createdByUID, pi.haveCreatedByUID
+}
+
+// BTFID returns the BTF ID associated with the program.
+//
+// The ID is only valid as long as the associated program is kept alive.
+// Available from 5.0.
+//
+// The bool return value indicates whether this optional field is available and
+// populated. (The field may be available but not populated if the kernel
+// supports the field but the program was loaded without BTF information.)
+func (pi *ProgramInfo) BTFID() (btf.ID, bool) {
+	return pi.btf, pi.btf > 0
+}
+
 // RunCount returns the total number of times the program was called.
 //
 // Can return 0 if the collection of statistics is not enabled. See EnableStats().
@@ -164,13 +295,113 @@ func (pi *ProgramInfo) Runtime() (time.Duration, bool) {
 	return time.Duration(0), false
 }
 
-func scanFdInfo(fd *internal.FD, fields map[string]interface{}) error {
-	raw, err := fd.Value()
-	if err != nil {
-		return err
+// RecursionMisses returns the total number of times the program was NOT called.
+// This can happen when another bpf program is already running on the cpu, which
+// is likely to happen for example when you interrupt bpf program execution.
+func (pi *ProgramInfo) RecursionMisses() (uint64, bool) {
+	if pi.stats != nil {
+		return pi.stats.recursionMisses, true
+	}
+	return 0, false
+}
+
+// Instructions returns the 'xlated' instruction stream of the program
+// after it has been verified and rewritten by the kernel. These instructions
+// cannot be loaded back into the kernel as-is, this is mainly used for
+// inspecting loaded programs for troubleshooting, dumping, etc.
+//
+// For example, map accesses are made to reference their kernel map IDs,
+// not the FDs they had when the program was inserted. Note that before
+// the introduction of bpf_insn_prepare_dump in kernel 4.16, xlated
+// instructions were not sanitized, making the output even less reusable
+// and less likely to round-trip or evaluate to the same program Tag.
+//
+// The first instruction is marked as a symbol using the Program's name.
+//
+// If available, the instructions will be annotated with metadata from the
+// BTF. This includes line information and function information. Reading
+// this metadata requires CAP_SYS_ADMIN or equivalent. If capability is
+// unavailable, the instructions will be returned without metadata.
+//
+// Available from 4.13. Requires CAP_BPF or equivalent for plain instructions.
+// Requires CAP_SYS_ADMIN for instructions with metadata.
+func (pi *ProgramInfo) Instructions() (asm.Instructions, error) {
+	// If the calling process is not BPF-capable or if the kernel doesn't
+	// support getting xlated instructions, the field will be zero.
+	if len(pi.insns) == 0 {
+		return nil, fmt.Errorf("insufficient permissions or unsupported kernel: %w", ErrNotSupported)
 	}
 
-	fh, err := os.Open(fmt.Sprintf("/proc/self/fdinfo/%d", raw))
+	r := bytes.NewReader(pi.insns)
+	var insns asm.Instructions
+	if err := insns.Unmarshal(r, internal.NativeEndian); err != nil {
+		return nil, fmt.Errorf("unmarshaling instructions: %w", err)
+	}
+
+	if pi.btf != 0 {
+		btfh, err := btf.NewHandleFromID(pi.btf)
+		if err != nil {
+			// Getting a BTF handle requires CAP_SYS_ADMIN, if not available we get an -EPERM.
+			// Ignore it and fall back to instructions without metadata.
+			if !errors.Is(err, unix.EPERM) {
+				return nil, fmt.Errorf("unable to get BTF handle: %w", err)
+			}
+		}
+
+		// If we have a BTF handle, we can use it to assign metadata to the instructions.
+		if btfh != nil {
+			defer btfh.Close()
+
+			spec, err := btfh.Spec(nil)
+			if err != nil {
+				return nil, fmt.Errorf("unable to get BTF spec: %w", err)
+			}
+
+			lineInfos, err := btf.LoadLineInfos(
+				bytes.NewReader(pi.lineInfos),
+				internal.NativeEndian,
+				pi.numLineInfos,
+				spec,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("parse line info: %w", err)
+			}
+
+			funcInfos, err := btf.LoadFuncInfos(
+				bytes.NewReader(pi.funcInfos),
+				internal.NativeEndian,
+				pi.numFuncInfos,
+				spec,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("parse func info: %w", err)
+			}
+
+			btf.AssignMetadataToInstructions(insns, funcInfos, lineInfos, btf.CORERelocationInfos{})
+		}
+	}
+
+	fn := btf.FuncMetadata(&insns[0])
+	name := pi.Name
+	if fn != nil {
+		name = fn.Name
+	}
+	insns[0] = insns[0].WithSymbol(name)
+
+	return insns, nil
+}
+
+// MapIDs returns the maps related to the program.
+//
+// Available from 4.15.
+//
+// The bool return value indicates whether this optional field is available.
+func (pi *ProgramInfo) MapIDs() ([]MapID, bool) {
+	return pi.maps, pi.maps != nil
+}
+
+func scanFdInfo(fd *sys.FD, fields map[string]interface{}) error {
+	fh, err := os.Open(fmt.Sprintf("/proc/self/fdinfo/%d", fd.Int()))
 	if err != nil {
 		return err
 	}
@@ -213,6 +444,10 @@ func scanFdInfoReader(r io.Reader, fields map[string]interface{}) error {
 		return err
 	}
 
+	if len(fields) > 0 && scanned == 0 {
+		return ErrNotSupported
+	}
+
 	if scanned != len(fields) {
 		return errMissingFields
 	}
@@ -227,13 +462,38 @@ func scanFdInfoReader(r io.Reader, fields map[string]interface{}) error {
 //
 // Requires at least 5.8.
 func EnableStats(which uint32) (io.Closer, error) {
-	attr := internal.BPFEnableStatsAttr{
-		StatsType: which,
-	}
-
-	fd, err := internal.BPFEnableStats(&attr)
+	fd, err := sys.EnableStats(&sys.EnableStatsAttr{
+		Type: which,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return fd, nil
 }
+
+var haveProgramInfoMapIDs = internal.NewFeatureTest("map IDs in program info", "4.15", func() error {
+	prog, err := progLoad(asm.Instructions{
+		asm.LoadImm(asm.R0, 0, asm.DWord),
+		asm.Return(),
+	}, SocketFilter, "MIT")
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+
+	err = sys.ObjInfo(prog, &sys.ProgInfo{
+		// NB: Don't need to allocate MapIds since the program isn't using
+		// any maps.
+		NrMapIds: 1,
+	})
+	if errors.Is(err, unix.EINVAL) {
+		// Most likely the syscall doesn't exist.
+		return internal.ErrNotSupported
+	}
+	if errors.Is(err, unix.E2BIG) {
+		// We've hit check_uarg_tail_zero on older kernels.
+		return internal.ErrNotSupported
+	}
+
+	return err
+})

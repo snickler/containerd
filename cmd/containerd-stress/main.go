@@ -28,15 +28,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/plugin"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/integration/remote"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/log"
 	metrics "github.com/docker/go-metrics"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
-
-const imageName = "docker.io/library/alpine:latest"
 
 var (
 	ct              metrics.LabeledTimer
@@ -45,8 +45,12 @@ var (
 	binarySizeGauge metrics.LabeledGauge
 )
 
+const (
+	stressNs string = "stress"
+)
+
 func init() {
-	ns := metrics.NewNamespace("stress", "", nil)
+	ns := metrics.NewNamespace(stressNs, "", nil)
 	// if you want more fine grained metrics then you can drill down with the metrics in prom that
 	// containerd is outputting
 	ct = ns.NewLabeledTimer("run", "Run time of a full container during the test", "commit")
@@ -59,6 +63,20 @@ func init() {
 	if err := setRlimit(); err != nil {
 		panic(err)
 	}
+
+	cli.HelpFlag = &cli.BoolFlag{
+		Name:    "help",
+		Aliases: []string{"h"},
+		Usage:   "Show help",
+	}
+}
+
+type worker interface {
+	run(ctx, tcxt context.Context)
+	getCount() int
+	incCount()
+	getFailures() int
+	incFailures()
 }
 
 type run struct {
@@ -81,10 +99,10 @@ func (r *run) seconds() float64 {
 	return r.ended.Sub(r.started).Seconds()
 }
 
-func (r *run) gather(workers []*worker) *result {
+func (r *run) gather(workers []worker) *result {
 	for _, w := range workers {
-		r.total += w.count
-		r.failures += w.failures
+		r.total += w.getCount()
+		r.failures += w.getFailures()
 	}
 	sec := r.seconds()
 	return &result{
@@ -106,81 +124,107 @@ type result struct {
 }
 
 func main() {
-	// morr power!
+	// more power!
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	app := cli.NewApp()
 	app.Name = "containerd-stress"
 	app.Description = "stress test a containerd daemon"
 	app.Flags = []cli.Flag{
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "debug",
-			Usage: "set debug output in the logs",
+			Usage: "Set debug output in the logs",
 		},
-		cli.StringFlag{
-			Name:  "address,a",
-			Value: "/run/containerd/containerd.sock",
-			Usage: "path to the containerd socket",
+		&cli.StringFlag{
+			Name:    "address",
+			Aliases: []string{"a"},
+			Value:   defaults.DefaultAddress,
+			Usage:   "Path to the containerd socket",
 		},
-		cli.IntFlag{
-			Name:  "concurrent,c",
-			Value: 1,
-			Usage: "set the concurrency of the stress test",
+		&cli.IntFlag{
+			Name:    "concurrent",
+			Aliases: []string{"c"},
+			Value:   1,
+			Usage:   "Set the concurrency of the stress test",
 		},
-		cli.DurationFlag{
-			Name:  "duration,d",
-			Value: 1 * time.Minute,
-			Usage: "set the duration of the stress test",
+		&cli.BoolFlag{
+			Name:  "cri",
+			Usage: "Utilize CRI to create pods for the stress test. This requires a runtime that matches CRI runtime handler. Example: --runtime runc",
 		},
-		cli.BoolFlag{
+		&cli.DurationFlag{
+			Name:    "duration",
+			Aliases: []string{"d"},
+			Value:   1 * time.Minute,
+			Usage:   "Set the duration of the stress test",
+		},
+		&cli.BoolFlag{
 			Name:  "exec",
-			Usage: "add execs to the stress tests",
+			Usage: "Add execs to the stress tests (non-CRI only)",
 		},
-		cli.BoolFlag{
-			Name:  "json,j",
-			Usage: "output results in json format",
+		&cli.StringFlag{
+			Name:    "image",
+			Aliases: []string{"i"},
+			Value:   "docker.io/library/alpine:latest",
+			Usage:   "Image to be utilized for testing",
 		},
-		cli.StringFlag{
-			Name:  "metrics,m",
-			Usage: "address to serve the metrics API",
+		&cli.BoolFlag{
+			Name:    "json",
+			Aliases: []string{"j"},
+			Usage:   "Output results in json format",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
+			Name:    "metrics",
+			Aliases: []string{"m"},
+			Usage:   "Address to serve the metrics API",
+		},
+		&cli.StringFlag{
 			Name:  "runtime",
-			Usage: "set the runtime to stress test",
-			Value: plugin.RuntimeRuncV2,
+			Usage: "Set the runtime to stress test",
+			Value: plugins.RuntimeRuncV2,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "snapshotter",
-			Usage: "set the snapshotter to use",
+			Usage: "Set the snapshotter to use",
 			Value: "overlayfs",
 		},
 	}
-	app.Before = func(context *cli.Context) error {
-		if context.GlobalBool("json") {
-			logrus.SetLevel(logrus.WarnLevel)
+	app.Before = func(cliContext *cli.Context) error {
+		if cliContext.Bool("json") {
+			if err := log.SetLevel("warn"); err != nil {
+				return err
+			}
 		}
-		if context.GlobalBool("debug") {
-			logrus.SetLevel(logrus.DebugLevel)
+		if cliContext.Bool("debug") {
+			if err := log.SetLevel("debug"); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
-	app.Commands = []cli.Command{
+	app.Commands = []*cli.Command{
 		densityCommand,
 	}
-	app.Action = func(context *cli.Context) error {
+	app.Action = func(cliContext *cli.Context) error {
 		config := config{
-			Address:     context.GlobalString("address"),
-			Duration:    context.GlobalDuration("duration"),
-			Concurrency: context.GlobalInt("concurrent"),
-			Exec:        context.GlobalBool("exec"),
-			JSON:        context.GlobalBool("json"),
-			Metrics:     context.GlobalString("metrics"),
-			Runtime:     context.GlobalString("runtime"),
-			Snapshotter: context.GlobalString("snapshotter"),
+			Address:     cliContext.String("address"),
+			Duration:    cliContext.Duration("duration"),
+			Concurrency: cliContext.Int("concurrent"),
+			CRI:         cliContext.Bool("cri"),
+			Exec:        cliContext.Bool("exec"),
+			Image:       cliContext.String("image"),
+			JSON:        cliContext.Bool("json"),
+			Metrics:     cliContext.String("metrics"),
+			Runtime:     cliContext.String("runtime"),
+			Snapshotter: cliContext.String("snapshotter"),
 		}
 		if config.Metrics != "" {
 			return serve(config)
 		}
+
+		if config.CRI {
+			return criTest(config)
+		}
+
 		return test(config)
 	}
 	if err := app.Run(os.Args); err != nil {
@@ -191,9 +235,11 @@ func main() {
 
 type config struct {
 	Concurrency int
+	CRI         bool
 	Duration    time.Duration
 	Address     string
 	Exec        bool
+	Image       string
 	JSON        bool
 	Metrics     string
 	Runtime     string
@@ -206,12 +252,98 @@ func (c config) newClient() (*containerd.Client, error) {
 
 func serve(c config) error {
 	go func() {
-		if err := http.ListenAndServe(c.Metrics, metrics.Handler()); err != nil {
-			logrus.WithError(err).Error("listen and serve")
+		srv := &http.Server{
+			Addr:              c.Metrics,
+			Handler:           metrics.Handler(),
+			ReadHeaderTimeout: 5 * time.Minute, // "G112: Potential Slowloris Attack (gosec)"; not a real concern for our use, so setting a long timeout.
+		}
+		if err := srv.ListenAndServe(); err != nil {
+			log.L.WithError(err).Error("listen and serve")
 		}
 	}()
 	checkBinarySizes()
+
+	if c.CRI {
+		return criTest(c)
+	}
+
 	return test(c)
+}
+
+func criTest(c config) error {
+	var (
+		timeout = 1 * time.Minute
+		wg      sync.WaitGroup
+		ctx     = namespaces.WithNamespace(context.Background(), stressNs)
+	)
+
+	client, err := remote.NewRuntimeService(c.Address, timeout)
+	if err != nil {
+		return fmt.Errorf("failed to create runtime service: %w", err)
+	}
+
+	if err := criCleanup(ctx, client); err != nil {
+		return err
+	}
+
+	tctx, cancel := context.WithTimeout(ctx, c.Duration)
+	go func() {
+		s := make(chan os.Signal, 1)
+		signal.Notify(s, syscall.SIGTERM, syscall.SIGINT)
+		<-s
+		cancel()
+	}()
+
+	// get runtime version:
+	version, err := client.Version("")
+	if err != nil {
+		return fmt.Errorf("failed to get runtime version: %w", err)
+	}
+	var (
+		workers []worker
+		r       = &run{}
+	)
+	log.L.Info("starting stress test run...")
+	// create the workers along with their spec
+	for i := 0; i < c.Concurrency; i++ {
+		wg.Add(1)
+		w := &criWorker{
+			id:             i,
+			wg:             &wg,
+			client:         client,
+			commit:         fmt.Sprintf("%s-%s", version.RuntimeName, version.RuntimeVersion),
+			runtimeHandler: c.Runtime,
+			snapshotter:    c.Snapshotter,
+		}
+		workers = append(workers, w)
+	}
+
+	// start the timer and run the worker
+	r.start()
+	for _, w := range workers {
+		go w.run(ctx, tctx)
+	}
+	// wait and end the timer
+	wg.Wait()
+	r.end()
+
+	results := r.gather(workers)
+	log.L.Infof("ending test run in %0.3f seconds", results.Seconds)
+
+	log.L.WithField("failures", r.failures).Infof(
+		"create/start/delete %d containers in %0.3f seconds (%0.3f c/sec) or (%0.3f sec/c)",
+		results.Total,
+		results.Seconds,
+		results.ContainersPerSecond,
+		results.SecondsPerContainer,
+	)
+	if c.JSON {
+		if err := json.NewEncoder(os.Stdout).Encode(results); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func test(c config) error {
@@ -228,11 +360,17 @@ func test(c config) error {
 	if err := cleanup(ctx, client); err != nil {
 		return err
 	}
-	logrus.Infof("pulling %s", imageName)
-	image, err := client.Pull(ctx, imageName, containerd.WithPullUnpack, containerd.WithPullSnapshotter(c.Snapshotter))
+
+	log.L.Infof("pulling %s", c.Image)
+	image, err := client.Pull(ctx, c.Image, containerd.WithPullUnpack, containerd.WithPullSnapshotter(c.Snapshotter))
 	if err != nil {
 		return err
 	}
+	v, err := client.Version(ctx)
+	if err != nil {
+		return err
+	}
+
 	tctx, cancel := context.WithTimeout(ctx, c.Duration)
 	go func() {
 		s := make(chan os.Signal, 1)
@@ -242,18 +380,15 @@ func test(c config) error {
 	}()
 
 	var (
-		workers []*worker
+		workers []worker
 		r       = &run{}
 	)
-	logrus.Info("starting stress test run...")
-	v, err := client.Version(ctx)
-	if err != nil {
-		return err
-	}
+	log.L.Info("starting stress test run...")
 	// create the workers along with their spec
 	for i := 0; i < c.Concurrency; i++ {
 		wg.Add(1)
-		w := &worker{
+
+		w := &ctrWorker{
 			id:          i,
 			wg:          &wg,
 			image:       image,
@@ -268,7 +403,7 @@ func test(c config) error {
 		for i := c.Concurrency; i < c.Concurrency+c.Concurrency; i++ {
 			wg.Add(1)
 			exec = &execWorker{
-				worker: worker{
+				ctrWorker: ctrWorker{
 					id:          i,
 					wg:          &wg,
 					image:       image,
@@ -295,9 +430,9 @@ func test(c config) error {
 		results.ExecTotal = exec.count
 		results.ExecFailures = exec.failures
 	}
-	logrus.Infof("ending test run in %0.3f seconds", results.Seconds)
+	log.L.Infof("ending test run in %0.3f seconds", results.Seconds)
 
-	logrus.WithField("failures", r.failures).Infof(
+	log.L.WithField("failures", r.failures).Infof(
 		"create/start/delete %d containers in %0.3f seconds (%0.3f c/sec) or (%0.3f sec/c)",
 		results.Total,
 		results.Seconds,

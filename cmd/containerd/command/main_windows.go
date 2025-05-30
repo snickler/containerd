@@ -26,8 +26,8 @@ import (
 	"github.com/Microsoft/go-winio/pkg/etw"
 	"github.com/Microsoft/go-winio/pkg/etwlogrus"
 	"github.com/Microsoft/go-winio/pkg/guid"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/services/server"
+	"github.com/containerd/containerd/v2/cmd/containerd/server"
+	"github.com/containerd/log"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
 )
@@ -39,7 +39,7 @@ var (
 	}
 )
 
-func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *server.Server) chan struct{} {
+func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *server.Server, cancel func()) chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		var server *server.Server
@@ -54,12 +54,12 @@ func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *se
 					log.G(ctx).WithError(err).Error("notify stopping failed")
 				}
 
-				if server == nil {
-					close(done)
-					return
+				cancel()
+				if server != nil {
+					server.Stop()
 				}
-				server.Stop()
 				close(done)
+				return
 			}
 		}
 	}()
@@ -75,7 +75,7 @@ func setupDumpStacks() {
 	ev, _ := windows.UTF16PtrFromString(event)
 	sd, err := windows.SecurityDescriptorFromString("D:P(A;;GA;;;BA)(A;;GA;;;SY)")
 	if err != nil {
-		logrus.Errorf("failed to get security descriptor for debug stackdump event %s: %s", event, err.Error())
+		log.L.Errorf("failed to get security descriptor for debug stackdump event %s: %s", event, err.Error())
 		return
 	}
 	var sa windows.SecurityAttributes
@@ -84,11 +84,11 @@ func setupDumpStacks() {
 	sa.SecurityDescriptor = sd
 	h, err := windows.CreateEvent(&sa, 0, 0, ev)
 	if h == 0 || err != nil {
-		logrus.Errorf("failed to create debug stackdump event %s: %s", event, err.Error())
+		log.L.Errorf("failed to create debug stackdump event %s: %s", event, err.Error())
 		return
 	}
 	go func() {
-		logrus.Debugf("Stackdump - waiting signal at %s", event)
+		log.L.Debugf("Stackdump - waiting signal at %s", event)
 		for {
 			windows.WaitForSingleObject(h, windows.INFINITE)
 			dumpStacks(true)
@@ -109,12 +109,12 @@ func init() {
 	// Microsoft/go-winio/tools/etw-provider-gen.
 	provider, err := etw.NewProvider("ContainerD", etwCallback)
 	if err != nil {
-		logrus.Error(err)
+		log.L.Error(err)
 	} else {
 		if hook, err := etwlogrus.NewHookFromProvider(provider); err == nil {
 			logrus.AddHook(hook)
 		} else {
-			logrus.Error(err)
+			log.L.Error(err)
 		}
 	}
 }

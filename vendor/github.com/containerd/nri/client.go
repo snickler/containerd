@@ -25,10 +25,9 @@ import (
 	"os/exec"
 	"sync"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/oci"
 	types "github.com/containerd/nri/types/v1"
-	"github.com/pkg/errors"
+
+	oci "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 const (
@@ -74,13 +73,29 @@ type Sandbox struct {
 	Labels map[string]string
 }
 
+// process is a subset of containerd's Process interface.
+type process interface {
+	// ID of the process
+	ID() string
+	// Pid is the system specific process id
+	Pid() uint32
+}
+
+// Task is a subset of containerd's Task interface.
+type Task interface {
+	process
+
+	// Spec returns the current OCI specification for the task
+	Spec(context.Context) (*oci.Spec, error)
+}
+
 // Invoke the ConfList of nri plugins
-func (c *Client) Invoke(ctx context.Context, task containerd.Task, state types.State) ([]*types.Result, error) {
+func (c *Client) Invoke(ctx context.Context, task Task, state types.State) ([]*types.Result, error) {
 	return c.InvokeWithSandbox(ctx, task, state, nil)
 }
 
 // InvokeWithSandbox invokes the ConfList of nri plugins
-func (c *Client) InvokeWithSandbox(ctx context.Context, task containerd.Task, state types.State, sandbox *Sandbox) ([]*types.Result, error) {
+func (c *Client) InvokeWithSandbox(ctx context.Context, task Task, state types.State, sandbox *Sandbox) ([]*types.Result, error) {
 	if len(c.conf.Plugins) == 0 {
 		return nil, nil
 	}
@@ -107,7 +122,7 @@ func (c *Client) InvokeWithSandbox(ctx context.Context, task containerd.Task, st
 		r.Conf = p.Conf
 		result, err := c.invokePlugin(ctx, p.Type, r)
 		if err != nil {
-			return nil, errors.Wrapf(err, "plugin: %s", p.Type)
+			return nil, fmt.Errorf("plugin: %s: %w", p.Type, err)
 		}
 		r.Results = append(r.Results, result)
 	}
@@ -141,7 +156,7 @@ func (c *Client) invokePlugin(ctx context.Context, name string, r *types.Request
 	}
 	var result types.Result
 	if err := json.Unmarshal(out, &result); err != nil {
-		return nil, errors.Errorf("failed to unmarshal plugin output: %s: %s", err.Error(), msg)
+		return nil, fmt.Errorf("failed to unmarshal plugin output %s: %w", msg, err)
 	}
 	if result.Err() != nil {
 		return nil, result.Err()

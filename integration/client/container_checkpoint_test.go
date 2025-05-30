@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
    Copyright The containerd Authors.
@@ -22,7 +22,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,10 +29,9 @@ import (
 	"syscall"
 	"testing"
 
-	. "github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/plugin"
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/oci"
 )
 
 const (
@@ -49,9 +47,6 @@ func TestCheckpointRestorePTY(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.Runtime() == plugin.RuntimeLinuxV1 {
-		t.Skip()
-	}
 
 	var (
 		ctx, cancel = testContext(t)
@@ -175,9 +170,6 @@ func TestCheckpointRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.Runtime() == plugin.RuntimeLinuxV1 {
-		t.Skip()
-	}
 
 	var (
 		ctx, cancel = testContext(t)
@@ -265,9 +257,6 @@ func TestCheckpointRestoreNewContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.Runtime() == plugin.RuntimeLinuxV1 {
-		t.Skip()
-	}
 
 	id := t.Name()
 	ctx, cancel := testContext(t)
@@ -355,9 +344,6 @@ func TestCheckpointLeaveRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.Runtime() == plugin.RuntimeLinuxV1 {
-		t.Skip()
-	}
 
 	var (
 		ctx, cancel = testContext(t)
@@ -455,11 +441,7 @@ func TestCheckpointRestoreWithImagePath(t *testing.T) {
 	}
 
 	// create image path store criu image files
-	crDir, err := ioutil.TempDir("", "test-cr")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(crDir)
+	crDir := t.TempDir()
 	imagePath := filepath.Join(crDir, "cr")
 	// checkpoint task
 	if _, err := task.Checkpoint(ctx, WithCheckpointImagePath(imagePath)); err != nil {
@@ -473,7 +455,7 @@ func TestCheckpointRestoreWithImagePath(t *testing.T) {
 	task.Delete(ctx)
 
 	// check image files have been dumped into image path
-	if files, err := ioutil.ReadDir(imagePath); err != nil || len(files) == 0 {
+	if files, err := os.ReadDir(imagePath); err != nil || len(files) == 0 {
 		t.Fatal("failed to checkpoint with image path set")
 	}
 
@@ -506,7 +488,7 @@ func TestCheckpointRestoreWithImagePath(t *testing.T) {
 
 	stdout := bytes.NewBuffer(nil)
 	spec.Process.Args = []string{"ps", "-ef"}
-	process, err := ntask.Exec(ctx, t.Name()+"_exec", spec.Process, cio.NewCreator(withByteBuffers(stdout)))
+	process, err := ntask.Exec(ctx, t.Name()+"_exec", spec.Process, cio.NewCreator(withStdout(stdout)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,9 +525,6 @@ func TestCheckpointOnPauseStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.Runtime() == plugin.RuntimeLinuxV1 {
-		t.Skip()
-	}
 
 	var (
 		ctx, cancel = testContext(t)

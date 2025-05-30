@@ -20,10 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -33,7 +33,7 @@ import (
 func WithProfile(profile string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
 		s.Linux.Seccomp = &specs.LinuxSeccomp{}
-		f, err := ioutil.ReadFile(profile)
+		f, err := os.ReadFile(profile)
 		if err != nil {
 			return fmt.Errorf("cannot load seccomp profile %q: %v", profile, err)
 		}

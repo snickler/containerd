@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
    Copyright The containerd Authors.
@@ -20,19 +20,19 @@ package v2
 
 import (
 	"context"
+	"fmt"
 
-	cgroupsv2 "github.com/containerd/cgroups/v2"
+	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
 	eventstypes "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/pkg/oom"
-	"github.com/containerd/containerd/runtime"
-	"github.com/containerd/containerd/runtime/v2/shim"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/oom"
+	"github.com/containerd/log"
 )
 
 // New returns an implementation that listens to OOM events
 // from a container's cgroups.
-func New(publisher shim.Publisher) (oom.Watcher, error) {
+func New(publisher events.Publisher) (oom.Watcher, error) {
 	return &watcher{
 		itemCh:    make(chan item),
 		publisher: publisher,
@@ -42,7 +42,7 @@ func New(publisher shim.Publisher) (oom.Watcher, error) {
 // watcher implementation for handling OOM events from a container's cgroup
 type watcher struct {
 	itemCh    chan item
-	publisher shim.Publisher
+	publisher events.Publisher
 }
 
 type item struct {
@@ -70,15 +70,15 @@ func (w *watcher) Run(ctx context.Context) {
 				continue
 			}
 			lastOOM := lastOOMMap[i.id]
-			if i.ev.OOM > lastOOM {
+			if i.ev.OOMKill > lastOOM {
 				if err := w.publisher.Publish(ctx, runtime.TaskOOMEventTopic, &eventstypes.TaskOOM{
 					ContainerID: i.id,
 				}); err != nil {
-					logrus.WithError(err).Error("publish OOM event")
+					log.G(ctx).WithError(err).Error("publish OOM event")
 				}
 			}
-			if i.ev.OOM > 0 {
-				lastOOMMap[i.id] = i.ev.OOM
+			if i.ev.OOMKill > 0 {
+				lastOOMMap[i.id] = i.ev.OOMKill
 			}
 		}
 	}
@@ -88,7 +88,7 @@ func (w *watcher) Run(ctx context.Context) {
 func (w *watcher) Add(id string, cgx interface{}) error {
 	cg, ok := cgx.(*cgroupsv2.Manager)
 	if !ok {
-		return errors.Errorf("expected *cgroupsv2.Manager, got: %T", cgx)
+		return fmt.Errorf("expected *cgroupsv2.Manager, got: %T", cgx)
 	}
 	// FIXME: cgroupsv2.Manager does not support closing eventCh routine currently.
 	// The routine shuts down when an error happens, mostly when the cgroup is deleted.
@@ -101,10 +101,13 @@ func (w *watcher) Add(id string, cgx interface{}) error {
 				i.ev = ev
 				w.itemCh <- i
 			case err := <-errCh:
-				i.err = err
-				w.itemCh <- i
-				// we no longer get any event/err when we got an err
-				logrus.WithError(err).Warn("error from *cgroupsv2.Manager.EventChan")
+				// channel is closed when cgroup gets deleted
+				if err != nil {
+					i.err = err
+					w.itemCh <- i
+					// we no longer get any event/err when we got an err
+					log.L.WithError(err).Warn("error from *cgroupsv2.Manager.EventChan")
+				}
 				return
 			}
 		}

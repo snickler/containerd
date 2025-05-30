@@ -19,13 +19,13 @@ package client
 import (
 	"testing"
 
-	. "github.com/containerd/containerd"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/images/converter"
-	"github.com/containerd/containerd/images/converter/uncompress"
-	"github.com/containerd/containerd/platforms"
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/converter"
+	"github.com/containerd/containerd/v2/core/images/converter/uncompress"
+	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"gotest.tools/v3/assert"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestConvert creates an image from testImage, with the following conversion:
@@ -72,7 +72,7 @@ func TestConvert(t *testing.T) {
 	}
 	// Assert that the image does not have any extra arch.
 	assert.Equal(t, 1, len(plats))
-	assert.Check(t, defPlat.Match(plats[0]))
+	assert.True(t, defPlat.Match(plats[0]))
 
 	// Assert that the media type is converted to OCI and also uncompressed
 	mani, err := images.Manifest(ctx, cs, dstImg.Target, defPlat)
@@ -80,10 +80,6 @@ func TestConvert(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, l := range mani.Layers {
-		if plats[0].OS == "windows" {
-			assert.Equal(t, ocispec.MediaTypeImageLayerNonDistributable, l.MediaType)
-		} else {
-			assert.Equal(t, ocispec.MediaTypeImageLayer, l.MediaType)
-		}
+		assert.Equal(t, ocispec.MediaTypeImageLayer, l.MediaType)
 	}
 }

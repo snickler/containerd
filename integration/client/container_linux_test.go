@@ -1,5 +1,3 @@
-// +build linux
-
 /*
    Copyright The containerd Authors.
 
@@ -23,143 +21,40 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/containerd/cgroups"
-	cgroupsv2 "github.com/containerd/cgroups/v2"
-	. "github.com/containerd/containerd"
-	apievents "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/log/logtest"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/plugin"
-	"github.com/containerd/containerd/runtime/linux/runctypes"
-	"github.com/containerd/containerd/runtime/v2/runc/options"
-	"github.com/containerd/containerd/sys"
-	"github.com/containerd/typeurl"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
+	"github.com/containerd/cgroups/v3"
+	"github.com/containerd/cgroups/v3/cgroup1"
+	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
+	"github.com/containerd/containerd/api/types/runc/options"
+	"github.com/containerd/errdefs"
+	"github.com/stretchr/testify/assert"
+
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/integration/failpoint"
+	"github.com/containerd/containerd/v2/integration/images"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/fifosync"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/containerd/v2/pkg/shim"
+	"github.com/containerd/containerd/v2/pkg/sys"
+	"github.com/containerd/containerd/v2/plugins"
+
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
-const testUserNSImage = "mirror.gcr.io/library/alpine:3.13.5"
-
-// TestRegressionIssue4769 verifies the number of task exit events.
-//
-// Issue: https://github.com/containerd/containerd/issues/4769.
-func TestRegressionIssue4769(t *testing.T) {
-	t.Parallel()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	// use unique namespace to get unique task events
-	id := t.Name()
-	ns := fmt.Sprintf("%s-%s", testNamespace, id)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ctx = namespaces.WithNamespace(ctx, ns)
-	ctx = logtest.WithT(ctx, t)
-
-	image, err := client.Pull(ctx, testImage, WithPullUnpack)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.ImageService().Delete(ctx, testImage, images.SynchronousDelete())
-
-	container, err := client.NewContainer(ctx, id,
-		WithNewSnapshot(id, image),
-		WithNewSpec(oci.WithImageConfig(image), withTrue()),
-		WithRuntime(client.Runtime(), nil),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	task, err := container.NewTask(ctx, empty())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
-
-	statusC, err := task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	eventStream, errC := client.EventService().Subscribe(ctx, "namespace=="+ns+",topic~=|^/tasks/exit|")
-
-	if err := task.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	var timeout = 3 * time.Second
-
-	select {
-	case et := <-statusC:
-		if got := et.ExitCode(); got != 0 {
-			t.Fatal(errors.Errorf("expect zero exit status, but got %v", got))
-		}
-	case <-time.After(timeout):
-		t.Fatal(fmt.Errorf("failed to get exit event in time"))
-	}
-
-	// start to check events
-	select {
-	case et := <-eventStream:
-		if et.Event == nil {
-			t.Fatal(errors.Errorf("unexpected empty event: %+v", et))
-		}
-
-		v, err := typeurl.UnmarshalAny(et.Event)
-		if err != nil {
-			t.Fatal(errors.Wrap(err, "failed to unmarshal event"))
-		}
-
-		if e, ok := v.(*apievents.TaskExit); !ok {
-			t.Fatal(errors.Errorf("unexpected event type: %+v", v))
-		} else if e.ExitStatus != 0 {
-			t.Fatal(errors.Errorf("expect zero exit status, but got %v", e.ExitStatus))
-		}
-	case err := <-errC:
-		t.Fatal(errors.Wrap(err, "unexpected error from event service"))
-
-	case <-time.After(timeout):
-		t.Fatal(fmt.Errorf("failed to get exit event in time"))
-	}
-
-	if _, err := task.Delete(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// check duplicate event should not show up
-	select {
-	case event := <-eventStream:
-		t.Fatal(errors.Errorf("unexpected exit event: %+v", event))
-	case err := <-errC:
-		t.Fatal(errors.Wrap(err, "unexpected error from event service"))
-	case <-time.After(timeout):
-	}
-}
+// We use this image for user ns tests because it has files with setuid bits
+var testUserNSImage = images.Get(images.VolumeOwnership)
 
 func TestTaskUpdate(t *testing.T) {
 	t.Parallel()
@@ -206,7 +101,7 @@ func TestTaskUpdate(t *testing.T) {
 	}
 
 	var (
-		cgroup  cgroups.Cgroup
+		cgroup  cgroup1.Cgroup
 		cgroup2 *cgroupsv2.Manager
 	)
 	// check that the task has a limit of 32mb
@@ -215,7 +110,7 @@ func TestTaskUpdate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cgroup2, err = cgroupsv2.LoadManager("/sys/fs/cgroup", groupPath)
+		cgroup2, err = cgroupsv2.Load(groupPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -227,11 +122,11 @@ func TestTaskUpdate(t *testing.T) {
 			t.Fatalf("expected memory limit to be set to %d but received %d", limit, stat.Memory.UsageLimit)
 		}
 	} else {
-		cgroup, err = cgroups.Load(cgroups.V1, cgroups.PidPath(int(task.Pid())))
+		cgroup, err = cgroup1.Load(cgroup1.PidPath(int(task.Pid())))
 		if err != nil {
 			t.Fatal(err)
 		}
-		stat, err := cgroup.Stat(cgroups.IgnoreNotExist)
+		stat, err := cgroup.Stat(cgroup1.IgnoreNotExist)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -257,7 +152,7 @@ func TestTaskUpdate(t *testing.T) {
 			t.Errorf("expected memory limit to be set to %d but received %d", limit, stat.Memory.UsageLimit)
 		}
 	} else {
-		stat, err := cgroup.Stat(cgroups.IgnoreNotExist)
+		stat, err := cgroup.Stat(cgroup1.IgnoreNotExist)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -273,6 +168,10 @@ func TestTaskUpdate(t *testing.T) {
 }
 
 func TestShimInCgroup(t *testing.T) {
+	if noShimCgroup {
+		t.Skip("shim cgroup is not enabled")
+	}
+
 	t.Parallel()
 
 	client, err := newClient(t, address)
@@ -298,7 +197,7 @@ func TestShimInCgroup(t *testing.T) {
 	// create a cgroup for the shim to use
 	path := "/containerd/shim"
 	var (
-		cg  cgroups.Cgroup
+		cg  cgroup1.Cgroup
 		cg2 *cgroupsv2.Manager
 	)
 	if cgroups.Mode() == cgroups.Unified {
@@ -308,7 +207,7 @@ func TestShimInCgroup(t *testing.T) {
 		}
 		defer cg2.Delete()
 	} else {
-		cg, err = cgroups.New(cgroups.V1, cgroups.StaticPath(path), &specs.LinuxResources{})
+		cg, err = cgroup1.New(cgroup1.StaticPath(path), &specs.LinuxResources{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -336,7 +235,7 @@ func TestShimInCgroup(t *testing.T) {
 			t.Errorf("created cgroup should have at least one process inside: %d", len(processes))
 		}
 	} else {
-		processes, err := cg.Processes(cgroups.Devices, false)
+		processes, err := cg.Processes(cgroup1.Devices, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -345,76 +244,6 @@ func TestShimInCgroup(t *testing.T) {
 		}
 	}
 	if err := task.Kill(ctx, unix.SIGKILL); err != nil {
-		t.Fatal(err)
-	}
-
-	<-statusC
-}
-
-func TestDaemonRestart(t *testing.T) {
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	var (
-		image       Image
-		ctx, cancel = testContext(t)
-		id          = t.Name()
-	)
-	defer cancel()
-
-	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "30")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	task, err := container.NewTask(ctx, empty())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
-
-	statusC, err := task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := task.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	var exitStatus ExitStatus
-	if err := ctrd.Restart(func() {
-		exitStatus = <-statusC
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if exitStatus.Error() == nil {
-		t.Errorf(`first task.Wait() should have failed with "transport is closing"`)
-	}
-
-	waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
-	serving, err := client.IsServing(waitCtx)
-	waitCancel()
-	if !serving {
-		t.Fatalf("containerd did not start within 2s: %v", err)
-	}
-
-	statusC, err = task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
 
@@ -489,6 +318,67 @@ func TestShimDoesNotLeakPipes(t *testing.T) {
 	}
 }
 
+func TestShimDoesNotLeakSockets(t *testing.T) {
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "30")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := container.NewTask(ctx, empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exitChannel, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+
+	<-exitChannel
+
+	if _, err := task.Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := container.Delete(ctx, WithSnapshotCleanup); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := shim.SocketAddress(ctx, address, id, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(strings.TrimPrefix(s, "unix://")); err == nil || !os.IsNotExist(err) {
+		t.Errorf("Shim sockets have leaked after container has been deleted.")
+	}
+}
+
 func numPipes(pid int) (int, error) {
 	cmd := exec.Command("sh", "-c", fmt.Sprintf("lsof -p %d | grep FIFO", pid))
 
@@ -553,16 +443,9 @@ func TestDaemonReconnectsToShimIOPipesOnRestart(t *testing.T) {
 
 	// After we restarted containerd we write some messages to the log pipes, simulating shim writing stuff there.
 	// Then we make sure that these messages are available on the containerd log thus proving that the server reconnected to the log pipes
-	runtimeVersion := getRuntimeVersion()
-	logDirPath := getLogDirPath(runtimeVersion, id)
+	logDirPath := getLogDirPath("v2", id)
 
-	switch runtimeVersion {
-	case "v1":
-		writeToFile(t, filepath.Join(logDirPath, "shim.stdout.log"), fmt.Sprintf("%s writing to stdout\n", id))
-		writeToFile(t, filepath.Join(logDirPath, "shim.stderr.log"), fmt.Sprintf("%s writing to stderr\n", id))
-	case "v2":
-		writeToFile(t, filepath.Join(logDirPath, "log"), fmt.Sprintf("%s writing to log\n", id))
-	}
+	writeToFile(t, filepath.Join(logDirPath, "log"), fmt.Sprintf("%s writing to log\n", id))
 
 	statusC, err := task.Wait(ctx)
 	if err != nil {
@@ -575,23 +458,13 @@ func TestDaemonReconnectsToShimIOPipesOnRestart(t *testing.T) {
 
 	<-statusC
 
-	stdioContents, err := ioutil.ReadFile(ctrdStdioFilePath)
+	stdioContents, err := os.ReadFile(ctrdStdioFilePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	switch runtimeVersion {
-	case "v1":
-		if !strings.Contains(string(stdioContents), fmt.Sprintf("%s writing to stdout", id)) {
-			t.Fatal("containerd did not connect to the shim stdout pipe")
-		}
-		if !strings.Contains(string(stdioContents), fmt.Sprintf("%s writing to stderr", id)) {
-			t.Fatal("containerd did not connect to the shim stderr pipe")
-		}
-	case "v2":
-		if !strings.Contains(string(stdioContents), fmt.Sprintf("%s writing to log", id)) {
-			t.Fatal("containerd did not connect to the shim log pipe")
-		}
+	if !strings.Contains(string(stdioContents), fmt.Sprintf("%s writing to log", id)) {
+		t.Fatal("containerd did not connect to the shim log pipe")
 	}
 }
 
@@ -610,8 +483,6 @@ func writeToFile(t *testing.T, filePath, message string) {
 
 func getLogDirPath(runtimeVersion, id string) string {
 	switch runtimeVersion {
-	case "v1":
-		return filepath.Join(defaultRoot, plugin.RuntimeLinuxV1, testNamespace, id)
 	case "v2":
 		return filepath.Join(defaultState, "io.containerd.runtime.v2.task", testNamespace, id)
 	default:
@@ -619,94 +490,8 @@ func getLogDirPath(runtimeVersion, id string) string {
 	}
 }
 
-func getRuntimeVersion() string {
-	switch rt := os.Getenv("TEST_RUNTIME"); rt {
-	case plugin.RuntimeLinuxV1:
-		return "v1"
-	default:
-		return "v2"
-	}
-}
-
-func TestContainerPTY(t *testing.T) {
-	t.Parallel()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	var (
-		image       Image
-		ctx, cancel = testContext(t)
-		id          = t.Name()
-	)
-	defer cancel()
-
-	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), oci.WithTTY, withProcessArgs("echo", "hello")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	direct, err := newDirectIO(ctx, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer direct.Delete()
-	var (
-		wg  sync.WaitGroup
-		buf = bytes.NewBuffer(nil)
-	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		io.Copy(buf, direct.Stdout)
-	}()
-
-	task, err := container.NewTask(ctx, direct.IOCreate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
-
-	status, err := task.Wait(ctx)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if err := task.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	<-status
-	wg.Wait()
-
-	if err := direct.Close(); err != nil {
-		t.Error(err)
-	}
-
-	out := buf.String()
-	if !strings.ContainsAny(fmt.Sprintf("%#q", out), `\x00`) {
-		t.Fatal(`expected \x00 in output`)
-	}
-}
-
 func TestContainerAttach(t *testing.T) {
 	t.Parallel()
-
-	if runtime.GOOS == "windows" {
-		// On windows, closing the write side of the pipe closes the read
-		// side, sending an EOF to it and preventing reopening it.
-		// Hence this test will always fails on windows
-		t.Skip("invalid logic on windows")
-	}
 
 	client, err := newClient(t, address)
 	if err != nil {
@@ -803,126 +588,6 @@ func TestContainerAttach(t *testing.T) {
 	}
 }
 
-func newDirectIO(ctx context.Context, terminal bool) (*directIO, error) {
-	fifos, err := cio.NewFIFOSetInDir("", "", terminal)
-	if err != nil {
-		return nil, err
-	}
-	dio, err := cio.NewDirectIO(ctx, fifos)
-	if err != nil {
-		return nil, err
-	}
-	return &directIO{DirectIO: *dio}, nil
-}
-
-type directIO struct {
-	cio.DirectIO
-}
-
-// ioCreate returns IO available for use with task creation
-func (f *directIO) IOCreate(id string) (cio.IO, error) {
-	return f, nil
-}
-
-// ioAttach returns IO available for use with task attachment
-func (f *directIO) IOAttach(set *cio.FIFOSet) (cio.IO, error) {
-	return f, nil
-}
-
-func (f *directIO) Cancel() {
-	// nothing to cancel as all operations are handled externally
-}
-
-// Close closes all open fds
-func (f *directIO) Close() error {
-	err := f.Stdin.Close()
-	if f.Stdout != nil {
-		if err2 := f.Stdout.Close(); err == nil {
-			err = err2
-		}
-	}
-	if f.Stderr != nil {
-		if err2 := f.Stderr.Close(); err == nil {
-			err = err2
-		}
-	}
-	return err
-}
-
-// Delete removes the underlying directory containing fifos
-func (f *directIO) Delete() error {
-	return f.DirectIO.Close()
-}
-
-func TestContainerUsername(t *testing.T) {
-	t.Parallel()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	var (
-		image       Image
-		ctx, cancel = testContext(t)
-		id          = t.Name()
-	)
-	defer cancel()
-
-	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	direct, err := newDirectIO(ctx, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer direct.Delete()
-	var (
-		wg  sync.WaitGroup
-		buf = bytes.NewBuffer(nil)
-	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		io.Copy(buf, direct.Stdout)
-	}()
-
-	// the www-data user in the busybox image has a uid of 33
-	container, err := client.NewContainer(ctx, id,
-		WithNewSnapshot(id, image),
-		WithNewSpec(oci.WithImageConfig(image), oci.WithUsername("www-data"), oci.WithProcessArgs("id", "-u")),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	task, err := container.NewTask(ctx, direct.IOCreate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
-
-	statusC, err := task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := task.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	<-statusC
-
-	wg.Wait()
-
-	output := strings.TrimSuffix(buf.String(), "\n")
-	if output != "33" {
-		t.Errorf("expected www-data uid to be 33 but received %q", output)
-	}
-}
-
 func TestContainerUser(t *testing.T) {
 	t.Parallel()
 	t.Run("UserNameAndGroupName", func(t *testing.T) { testContainerUser(t, "www-data:www-data", "33:33") })
@@ -999,13 +664,6 @@ func testContainerUser(t *testing.T, userstr, expectedOutput string) {
 
 func TestContainerAttachProcess(t *testing.T) {
 	t.Parallel()
-
-	if runtime.GOOS == "windows" {
-		// On windows, closing the write side of the pipe closes the read
-		// side, sending an EOF to it and preventing reopening it.
-		// Hence this test will always fails on windows
-		t.Skip("invalid logic on windows")
-	}
 
 	client, err := newClient(t, address)
 	if err != nil {
@@ -1123,13 +781,6 @@ func TestContainerAttachProcess(t *testing.T) {
 
 func TestContainerLoadUnexistingProcess(t *testing.T) {
 	t.Parallel()
-
-	if runtime.GOOS == "windows" {
-		// On windows, closing the write side of the pipe closes the read
-		// side, sending an EOF to it and preventing reopening it.
-		// Hence this test will always fails on windows
-		t.Skip("invalid logic on windows")
-	}
 
 	client, err := newClient(t, address)
 	if err != nil {
@@ -1294,8 +945,7 @@ func TestContainerKillAll(t *testing.T) {
 	}
 	defer container.Delete(ctx, WithSnapshotCleanup)
 
-	stdout := bytes.NewBuffer(nil)
-	task, err := container.NewTask(ctx, cio.NewCreator(withByteBuffers(stdout)))
+	task, err := container.NewTask(ctx, cio.NullIO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1375,7 +1025,7 @@ func TestDaemonRestartWithRunningShim(t *testing.T) {
 		t.Errorf(`first task.Wait() should have failed with "transport is closing"`)
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	c, err := ctrd.waitForStart(waitCtx)
 	cancel()
 	if err != nil {
@@ -1396,49 +1046,6 @@ func TestDaemonRestartWithRunningShim(t *testing.T) {
 
 	if err := unix.Kill(int(pid), 0); err != unix.ESRCH {
 		t.Errorf("pid %d still exists", pid)
-	}
-}
-
-func TestContainerRuntimeOptionsv1(t *testing.T) {
-	t.Parallel()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	var (
-		image       Image
-		ctx, cancel = testContext(t)
-		id          = t.Name()
-	)
-	defer cancel()
-
-	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	container, err := client.NewContainer(
-		ctx, id,
-		WithNewSnapshot(id, image),
-		WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)),
-		WithRuntime(plugin.RuntimeLinuxV1, &runctypes.RuncOptions{Runtime: "no-runc"}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	task, err := container.NewTask(ctx, empty())
-	if err == nil {
-		t.Errorf("task creation should have failed")
-		task.Delete(ctx)
-		return
-	}
-	if !strings.Contains(err.Error(), `"no-runc"`) {
-		t.Errorf("task creation should have failed because of lack of executable. Instead failed with: %v", err.Error())
 	}
 }
 
@@ -1467,7 +1074,7 @@ func TestContainerRuntimeOptionsv2(t *testing.T) {
 		ctx, id,
 		WithNewSnapshot(id, image),
 		WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)),
-		WithRuntime(plugin.RuntimeRuncV1, &options.Options{BinaryName: "no-runc"}),
+		WithRuntime(plugins.RuntimeRuncV2, &options.Options{BinaryName: "no-runc"}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1483,76 +1090,18 @@ func TestContainerRuntimeOptionsv2(t *testing.T) {
 	if !strings.Contains(err.Error(), `"no-runc"`) {
 		t.Errorf("task creation should have failed because of lack of executable. Instead failed with: %v", err.Error())
 	}
-}
 
-func initContainerAndCheckChildrenDieOnKill(t *testing.T, opts ...oci.SpecOpts) {
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
+	// It doesn't matter what the NewTaskOpts function is. We are using an existing function in the client package,
+	// which will cause the TaskOptions in the new task request to be non-empty.
+	// https://github.com/containerd/containerd/issues/11568
+	task, err = container.NewTask(ctx, empty(), WithNoNewKeyring)
+	if err == nil {
+		t.Errorf("task creation should have failed")
+		task.Delete(ctx)
+		return
 	}
-	defer client.Close()
-
-	var (
-		image       Image
-		ctx, cancel = testContext(t)
-		id          = t.Name()
-	)
-	defer cancel()
-
-	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	opts = append(opts, oci.WithImageConfig(image))
-	opts = append(opts, withProcessArgs("sh", "-c", "sleep 42; echo hi"))
-
-	container, err := client.NewContainer(ctx, id,
-		WithNewSnapshot(id, image),
-		WithNewSpec(opts...),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	stdout := bytes.NewBuffer(nil)
-	task, err := container.NewTask(ctx, cio.NewCreator(withByteBuffers(stdout)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
-
-	statusC, err := task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := task.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
-		t.Error(err)
-	}
-
-	// Give the shim time to reap the init process and kill the orphans
-	select {
-	case <-statusC:
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	b, err := exec.Command("ps", "ax").CombinedOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if strings.Contains(string(b), "sleep 42") {
-		t.Fatalf("killing init didn't kill all its children:\n%v", string(b))
-	}
-
-	if _, err := task.Delete(ctx, WithProcessKill); err != nil {
-		t.Error(err)
+	if !strings.Contains(err.Error(), `"no-runc"`) {
+		t.Errorf("task creation should have failed because of lack of executable. Instead failed with: %v", err.Error())
 	}
 }
 
@@ -1560,15 +1109,62 @@ func TestContainerKillInitPidHost(t *testing.T) {
 	initContainerAndCheckChildrenDieOnKill(t, oci.WithHostNamespace(specs.PIDNamespace))
 }
 
-func TestContainerKillInitKillsChildWhenNotHostPid(t *testing.T) {
-	initContainerAndCheckChildrenDieOnKill(t)
-}
-
 func TestUserNamespaces(t *testing.T) {
-	t.Parallel()
-	t.Run("WritableRootFS", func(t *testing.T) { testUserNamespaces(t, false) })
-	// see #1373 and runc#1572
-	t.Run("ReadonlyRootFS", func(t *testing.T) { testUserNamespaces(t, true) })
+	for name, test := range map[string]struct {
+		testCmd  oci.SpecOpts
+		roRootFS bool
+		exitCode uint32 // testUserNamespaces validates the exit code of the test container against this value
+		uidmaps  []specs.LinuxIDMapping
+		gidmaps  []specs.LinuxIDMapping
+	}{
+		"WritableRootFS": {
+			testCmd:  withExitStatus(7),
+			roRootFS: false,
+			exitCode: 7,
+			uidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 1000, Size: 65535}},
+			gidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 2000, Size: 65535}},
+		},
+		// see #1373 and runc#1572
+		"ReadonlyRootFS": {
+			testCmd:  withExitStatus(7),
+			roRootFS: true,
+			exitCode: 7,
+			uidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 1000, Size: 65535}},
+			gidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 2000, Size: 65535}},
+		},
+		"CheckSetUidBit": {
+			testCmd:  withProcessArgs("bash", "-c", "[ -u /usr/bin/passwd ] && exit 7"),
+			roRootFS: false,
+			exitCode: 7,
+			uidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 1000, Size: 65535}},
+			gidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 2000, Size: 65535}},
+		},
+		"WritableRootFSMultipleMap": {
+			testCmd:  withExitStatus(7),
+			roRootFS: false,
+			exitCode: 7,
+			uidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: 10}, {ContainerID: 10, HostID: 1000, Size: 65535}},
+			gidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: 20}, {ContainerID: 20, HostID: 2000, Size: 65535}},
+		},
+		"ReadonlyRootFSMultipleMap": {
+			testCmd:  withExitStatus(7),
+			roRootFS: true,
+			exitCode: 7,
+			uidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: 20}, {ContainerID: 20, HostID: 2000, Size: 65535}},
+			gidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: 20}, {ContainerID: 20, HostID: 2000, Size: 65535}},
+		},
+		"CheckSetUidBitMultipleMap": {
+			testCmd:  withProcessArgs("bash", "-c", "[ -u /usr/bin/passwd ] && exit 7"),
+			roRootFS: false,
+			exitCode: 7,
+			uidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: 20}, {ContainerID: 20, HostID: 2000, Size: 65535}},
+			gidmaps:  []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: 20}, {ContainerID: 20, HostID: 2000, Size: 65535}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testUserNamespaces(t, test.uidmaps, test.gidmaps, test.testCmd, test.roRootFS, test.exitCode)
+		})
+	}
 }
 
 func checkUserNS(t *testing.T) {
@@ -1582,7 +1178,7 @@ func checkUserNS(t *testing.T) {
 	}
 }
 
-func testUserNamespaces(t *testing.T, readonlyRootFS bool) {
+func testUserNamespaces(t *testing.T, uidmaps, gidmaps []specs.LinuxIDMapping, cmdOpt oci.SpecOpts, readonlyRootFS bool, expected uint32) {
 	checkUserNS(t)
 
 	client, err := newClient(t, address)
@@ -1604,25 +1200,23 @@ func testUserNamespaces(t *testing.T, readonlyRootFS bool) {
 	}
 
 	opts := []NewContainerOpts{WithNewSpec(oci.WithImageConfig(image),
-		withExitStatus(7),
-		oci.WithUserNamespace([]specs.LinuxIDMapping{
-			{
-				ContainerID: 0,
-				HostID:      1000,
-				Size:        10000,
-			},
-		}, []specs.LinuxIDMapping{
-			{
-				ContainerID: 0,
-				HostID:      2000,
-				Size:        10000,
-			},
-		}),
+		cmdOpt,
+		oci.WithUserID(34), // run task as the "backup" user
+		oci.WithUserNamespace(uidmaps, gidmaps),
 	)}
+
 	if readonlyRootFS {
-		opts = append([]NewContainerOpts{WithRemappedSnapshotView(id, image, 1000, 2000)}, opts...)
+		if len(uidmaps) > 1 {
+			opts = append([]NewContainerOpts{WithUserNSRemappedSnapshotView(id, image, uidmaps, gidmaps)}, opts...)
+		} else {
+			opts = append([]NewContainerOpts{WithRemappedSnapshotView(id, image, 1000, 2000)}, opts...)
+		}
 	} else {
-		opts = append([]NewContainerOpts{WithRemappedSnapshot(id, image, 1000, 2000)}, opts...)
+		if len(uidmaps) > 1 {
+			opts = append([]NewContainerOpts{WithUserNSRemappedSnapshot(id, image, uidmaps, gidmaps)}, opts...)
+		} else {
+			opts = append([]NewContainerOpts{WithRemappedSnapshot(id, image, 1000, 2000)}, opts...)
+		}
 	}
 
 	container, err := client.NewContainer(ctx, id, opts...)
@@ -1631,17 +1225,9 @@ func testUserNamespaces(t *testing.T, readonlyRootFS bool) {
 	}
 	defer container.Delete(ctx, WithSnapshotCleanup)
 
-	var copts interface{}
-	if CheckRuntime(client.Runtime(), "io.containerd.runc") {
-		copts = &options.Options{
-			IoUid: 1000,
-			IoGid: 2000,
-		}
-	} else {
-		copts = &runctypes.CreateOptions{
-			IoUid: 1000,
-			IoGid: 2000,
-		}
+	copts := &options.Options{
+		IoUid: 1000,
+		IoGid: 2000,
 	}
 
 	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio), func(_ context.Context, client *Client, r *TaskInfo) error {
@@ -1671,119 +1257,15 @@ func testUserNamespaces(t *testing.T, readonlyRootFS bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != 7 {
-		t.Errorf("expected status 7 from wait but received %d", code)
+	if code != expected {
+		t.Errorf("expected status %d from wait but received %d", expected, code)
 	}
 	deleteStatus, err := task.Delete(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ec := deleteStatus.ExitCode(); ec != 7 {
-		t.Errorf("expected status 7 from delete but received %d", ec)
-	}
-}
-
-func TestTaskResize(t *testing.T) {
-	t.Parallel()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	var (
-		image       Image
-		ctx, cancel = testContext(t)
-		id          = t.Name()
-	)
-	defer cancel()
-
-	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	task, err := container.NewTask(ctx, empty())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
-
-	statusC, err := task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := task.Resize(ctx, 32, 32); err != nil {
-		t.Fatal(err)
-	}
-	task.Kill(ctx, syscall.SIGKILL)
-	<-statusC
-}
-
-func TestContainerImage(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := testContext(t)
-	defer cancel()
-	id := t.Name()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	image, err := client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	container, err := client.NewContainer(ctx, id, WithNewSpec(), WithImage(image))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx)
-
-	i, err := container.Image(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if i.Name() != image.Name() {
-		t.Fatalf("expected container image name %s but received %s", image.Name(), i.Name())
-	}
-}
-
-func TestContainerNoImage(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := testContext(t)
-	defer cancel()
-	id := t.Name()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	container, err := client.NewContainer(ctx, id, WithNewSpec())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx)
-
-	_, err = container.Image(ctx)
-	if err == nil {
-		t.Fatal("error should not be nil when container is created without an image")
-	}
-	if !errdefs.IsNotFound(err) {
-		t.Fatalf("expected error to be %s but received %s", errdefs.ErrNotFound, err)
+	if ec := deleteStatus.ExitCode(); ec != expected {
+		t.Errorf("expected status %d from delete but received %d", expected, ec)
 	}
 }
 
@@ -1939,55 +1421,6 @@ func TestBindLowPortNonOpt(t *testing.T) {
 	}
 }
 
-func TestContainerNoSTDIN(t *testing.T) {
-	t.Parallel()
-
-	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	var (
-		image       Image
-		ctx, cancel = testContext(t)
-		id          = t.Name()
-	)
-	defer cancel()
-
-	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withExitStatus(0)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
-
-	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStreams(nil, ioutil.Discard, ioutil.Discard)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
-
-	statusC, err := task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := task.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	status := <-statusC
-	code, _, err := status.Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if code != 0 {
-		t.Errorf("expected status 0 from wait but received %d", code)
-	}
-}
-
 func TestShimOOMScore(t *testing.T) {
 	containerdPid := ctrd.cmd.Process.Pid
 	containerdScore, err := sys.GetOOMScoreAdj(containerdPid)
@@ -2010,7 +1443,7 @@ func TestShimOOMScore(t *testing.T) {
 
 	path := "/containerd/oomshim"
 	var (
-		cg  cgroups.Cgroup
+		cg  cgroup1.Cgroup
 		cg2 *cgroupsv2.Manager
 	)
 	if cgroups.Mode() == cgroups.Unified {
@@ -2020,7 +1453,7 @@ func TestShimOOMScore(t *testing.T) {
 		}
 		defer cg2.Delete()
 	} else {
-		cg, err = cgroups.New(cgroups.V1, cgroups.StaticPath(path), &specs.LinuxResources{})
+		cg, err = cgroup1.New(cgroup1.StaticPath(path), &specs.LinuxResources{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2070,7 +1503,7 @@ func TestShimOOMScore(t *testing.T) {
 			}
 		}
 	} else {
-		processes, err := cg.Processes(cgroups.Devices, false)
+		processes, err := cg.Processes(cgroup1.Devices, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2089,16 +1522,25 @@ func TestShimOOMScore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	<-statusC
+	select {
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for task exit event")
+	case <-statusC:
+	}
 }
 
-func TestTaskSpec(t *testing.T) {
-	t.Parallel()
+// TestIssue9103 is used as regression case for issue 9103.
+//
+// The runc-fp will kill the init process so that the shim should return stopped
+// status after container.NewTask. It's used to simulate that the runc-init
+// might be killed by oom-kill.
+func TestIssue9103(t *testing.T) {
+	if f := os.Getenv("RUNC_FLAVOR"); f != "" && f != "runc" {
+		t.Skip("test requires runc")
+	}
 
 	client, err := newClient(t, address)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer client.Close()
 
 	var (
@@ -2109,55 +1551,275 @@ func TestTaskSpec(t *testing.T) {
 	defer cancel()
 
 	image, err = client.GetImage(ctx, testImage)
-	if err != nil {
-		t.Fatal(err)
+	require.NoError(t, err)
+
+	for idx, tc := range []struct {
+		desc           string
+		cntrOpts       []NewContainerOpts
+		bakingFn       func(ctx context.Context, t *testing.T, task Task)
+		expectedStatus ProcessStatus
+	}{
+		{
+			desc: "should be created status",
+			cntrOpts: []NewContainerOpts{
+				WithNewSpec(oci.WithImageConfig(image),
+					withProcessArgs("sleep", "30"),
+				),
+			},
+			bakingFn:       func(context.Context, *testing.T, Task) {},
+			expectedStatus: Created,
+		},
+		{
+			desc: "should be stopped status if init has been killed",
+			cntrOpts: []NewContainerOpts{
+				WithNewSpec(oci.WithImageConfig(image),
+					withProcessArgs("sleep", "30"),
+					oci.WithAnnotations(map[string]string{
+						"oci.runc.failpoint.profile": "issue9103",
+					}),
+				),
+				WithRuntime(client.Runtime(), &options.Options{
+					BinaryName: "runc-fp",
+				}),
+			},
+			bakingFn: func(ctx context.Context, t *testing.T, task Task) {
+				waitCh, err := task.Wait(ctx)
+				require.NoError(t, err)
+
+				select {
+				case <-time.After(30 * time.Second):
+					t.Fatal("timeout")
+				case e := <-waitCh:
+					require.NoError(t, e.Error())
+				}
+			},
+			expectedStatus: Stopped,
+		},
+	} {
+		tName := fmt.Sprintf("%s%d", id, idx)
+		t.Run(tc.desc, func(t *testing.T) {
+			container, err := client.NewContainer(ctx, tName,
+				append([]NewContainerOpts{WithNewSnapshot(tName, image)}, tc.cntrOpts...)...,
+			)
+			require.NoError(t, err)
+			defer container.Delete(ctx, WithSnapshotCleanup)
+
+			cctx, ccancel := context.WithTimeout(ctx, 30*time.Second)
+			task, err := container.NewTask(cctx, empty())
+			ccancel()
+			require.NoError(t, err)
+
+			defer task.Delete(ctx, WithProcessKill)
+
+			tc.bakingFn(ctx, t, task)
+
+			status, err := task.Status(ctx)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedStatus, status.Status)
+		})
+	}
+}
+
+// TestIssue10589 is used as regression case for issue 10589.
+//
+// This issue was caused by a race between init exits and new exec process tracking inside the shim.  The test operates
+// by controlling the time between when the shim invokes "runc exec" and when the actual "runc exec" is triggered.  This
+// allows validating that races for shim state tracking between pre- and post-start of the exec process do not exist.
+//
+// The workflow is as follows:
+// 1. Create a container as normal
+// 2. Make an exec1 using runc-fp with delayexec
+// 3. Wait until the exec is waiting to start (triggered by delayexec)
+// 4. Kill the container init process (signalling it is easiest)
+// 5. Make an exec2 using runc-fp with delayexec
+// 6. Wait until the exec is waiting to start
+// 7. Allow exec1 to proceed
+// 8. Allow exec2 to proceed
+// 9. See that the container has exited and all execs have exited too
+//
+// https://github.com/containerd/containerd/issues/10589
+func TestIssue10589(t *testing.T) {
+	if f := os.Getenv("RUNC_FLAVOR"); f != "" && f != "runc" {
+		t.Skip("test requires runc")
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), longCommand))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer container.Delete(ctx, WithSnapshotCleanup)
+	client, err := newClient(t, address)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		client.Close()
+	})
+
+	var (
+		image       Image
+		ctx, cancel = testContext(t)
+		id          = t.Name()
+	)
+	t.Cleanup(cancel)
+
+	image, err = client.GetImage(ctx, testImage)
+	require.NoError(t, err)
+
+	// 1. Create a sleeping container
+	t.Log("1. Create a sleeping container")
+	container, err := client.NewContainer(ctx, id,
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image),
+			withProcessArgs("sleep", "inf"),
+			oci.WithAnnotations(map[string]string{
+				"oci.runc.failpoint.profile": "delayExec",
+			}),
+		),
+		WithRuntime(client.Runtime(), &options.Options{
+			BinaryName: "runc-fp",
+		}),
+	)
+	require.NoError(t, err, "create container")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := container.Delete(ctx, WithSnapshotCleanup)
+		if err != nil {
+			t.Log("delete err", err)
+		}
+		cancel()
+	})
 
 	task, err := container.NewTask(ctx, empty())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer task.Delete(ctx)
+	require.NoError(t, err, "create task")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		st, err := task.Delete(ctx, WithProcessKill)
+		t.Log("exit status", st)
+		if err != nil {
+			t.Log("kill err", err)
+		}
+		cancel()
+	})
 
-	statusC, err := task.Wait(ctx)
-	if err != nil {
-		t.Fatal(err)
+	err = task.Start(ctx)
+	require.NoError(t, err, "start container")
+
+	status, err := task.Status(ctx)
+	require.NoError(t, err, "container status")
+	require.Equal(t, Running, status.Status)
+
+	// 2. Create an exec
+	t.Log("2. Create exec1")
+	exec1ReadyFifo, err := fifosync.NewWaiter(filepath.Join(t.TempDir(), "exec1-ready.fifo"), 0600)
+	require.NoError(t, err, "create exec1 ready fifo")
+	exec1DelayFifo, err := fifosync.NewTrigger(filepath.Join(t.TempDir(), "exec1-delay.fifo"), 0600)
+	require.NoError(t, err, "create exec1 delay fifo")
+	exec1, err := task.Exec(ctx, "exec1", &specs.Process{
+		Args: []string{"/bin/sleep", "301"},
+		Cwd:  "/",
+		Env: []string{
+			failpoint.DelayExecReadyEnv + "=" + exec1ReadyFifo.Name(),
+			failpoint.DelayExecDelayEnv + "=" + exec1DelayFifo.Name(),
+		},
+	}, cio.NullIO)
+	require.NoError(t, err, "create exec1")
+
+	exec1done := make(chan struct{})
+	go func() {
+		defer close(exec1done)
+		t.Log("Starting exec1")
+		err := exec1.Start(ctx)
+		assert.Error(t, err, "start exec1")
+		t.Logf("error starting exec1: %s", err)
+	}()
+
+	// 3. Wait until the exec is waiting to start
+	t.Log("3. Wait until exec1 is waiting to start")
+	err = exec1ReadyFifo.Wait()
+	require.NoError(t, err, "open exec1 fifo")
+
+	// 4. Kill the container init process
+	t.Log("4. Kill the container init process")
+	target := task.Pid()
+	t.Logf("Killing main pid (%v) of container %s", target, container.ID())
+	syscall.Kill(int(target), syscall.SIGKILL)
+	status, err = task.Status(ctx)
+	require.NoError(t, err, "container status")
+	t.Log("container status", status.Status)
+
+	// 5. Make an exec (2) using this failpoint
+	t.Log("5. Create exec2")
+	exec2ReadyFifo, err := fifosync.NewWaiter(filepath.Join(t.TempDir(), "exec2-ready.fifo"), 0600)
+	require.NoError(t, err, "create exec2 ready fifo: %q", exec2ReadyFifo)
+	exec2DelayFifo, err := fifosync.NewTrigger(filepath.Join(t.TempDir(), "exec2-delay.fifo"), 0600)
+	require.NoError(t, err, "create exec2 delay fifo: %q", exec2DelayFifo)
+	exec2, err := task.Exec(ctx, "exec2", &specs.Process{
+		Args: []string{"/bin/sleep", "302"},
+		Cwd:  "/",
+		Env: []string{
+			failpoint.DelayExecReadyEnv + "=" + exec2ReadyFifo.Name(),
+			failpoint.DelayExecDelayEnv + "=" + exec2DelayFifo.Name(),
+		},
+	}, cio.NullIO)
+	require.NoError(t, err, "create exec2")
+
+	exec2done := make(chan struct{})
+	didExec2Run := true
+	go func() {
+		defer close(exec2done)
+		t.Log("Starting exec2")
+		err := exec2.Start(ctx)
+		assert.Error(t, err, "start exec2")
+		t.Logf("error starting exec2: %s", err)
+	}()
+
+	// 6. Wait until the exec is waiting to start
+	t.Log("6. Wait until exec2 is waiting to start")
+	exec2ready := make(chan struct{})
+	go func() {
+		exec2ReadyFifo.Wait()
+		close(exec2ready)
+	}()
+	select {
+	case <-exec2ready:
+	case <-exec2done:
+		didExec2Run = false
 	}
 
-	spec, err := task.Spec(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if spec == nil {
-		t.Fatal("spec from task is nil")
-	}
-	direct, err := newDirectIO(ctx, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer direct.Delete()
+	// 7. Allow exec=1 to proceed
+	t.Log("7. Allow exec=1 to proceed")
+	err = exec1DelayFifo.Trigger()
+	assert.NoError(t, err, "trigger exec1 fifo")
+	status, err = task.Status(ctx)
+	require.NoError(t, err, "container status")
+	t.Log("container status", status.Status)
+	<-exec1done
+	status, err = task.Status(ctx)
+	require.NoError(t, err, "container status")
+	t.Log("container status", status.Status)
 
-	lt, err := container.Task(ctx, direct.IOAttach)
-	if err != nil {
-		t.Fatal(err)
+	// 8. Allow exec=2 to proceed
+	if didExec2Run {
+		t.Log("8. Allow exec2 to proceed")
+		err = exec2DelayFifo.Trigger()
+		assert.NoError(t, err, "trigger exec2 fifo")
+		status, err = task.Status(ctx)
+		require.NoError(t, err, "container status")
+		t.Log("container status", status.Status)
+		<-exec2done
+		status, err = task.Status(ctx)
+		require.NoError(t, err, "container status")
+		t.Log("container status", status.Status)
+	} else {
+		t.Log("8. Skip exec2")
 	}
 
-	spec, err = lt.Spec(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if spec == nil {
-		t.Fatal("spec from loaded task is nil")
-	}
-
-	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
-		t.Fatal(err)
-	}
-	<-statusC
+	// 9. Validate
+	t.Log("9. Validate")
+	status, err = exec1.Status(ctx)
+	require.NoError(t, err, "exec1 status")
+	t.Logf("exec1 status: %s", status.Status)
+	assert.Equal(t, Created, status.Status)
+	status, err = exec2.Status(ctx)
+	require.NoError(t, err, "exec2 status")
+	t.Logf("exec2 status: %s", status.Status)
+	assert.Equal(t, Created, status.Status)
+	status, err = task.Status(ctx)
+	t.Logf("task status: %s", status.Status)
+	require.NoError(t, err, "container status")
+	assert.Equal(t, Stopped, status.Status)
 }

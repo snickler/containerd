@@ -17,21 +17,28 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/images/archive"
-	"github.com/containerd/containerd/log"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/containerd/v2/core/transfer"
+	tarchive "github.com/containerd/containerd/v2/core/transfer/archive"
+	"github.com/containerd/containerd/v2/core/transfer/image"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
 )
 
-var importCommand = cli.Command{
+var importCommand = &cli.Command{
 	Name:      "import",
-	Usage:     "import images",
+	Usage:     "Import images",
 	ArgsUsage: "[flags] <in>",
 	Description: `Import images from a tar stream.
 Implemented formats:
@@ -51,40 +58,150 @@ If foobar.tar contains an OCI ref named "latest" and anonymous ref "sha256:deadb
 "foo/bar:latest" and "foo/bar@sha256:deadbeef" images in the containerd store.
 `,
 	Flags: append([]cli.Flag{
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "base-name",
 			Value: "",
-			Usage: "base image name for added images, when provided only images with this name prefix are imported",
+			Usage: "Base image name for added images, when provided only images with this name prefix are imported",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "digests",
-			Usage: "whether to create digest images (default: false)",
+			Usage: "Whether to create digest images (default: false)",
 		},
-		cli.StringFlag{
+		&cli.BoolFlag{
+			Name:  "skip-digest-for-named",
+			Usage: "Skip applying --digests option to images named in the importing tar (use it in conjunction with --digests)",
+		},
+		&cli.StringFlag{
 			Name:  "index-name",
-			Usage: "image name to keep index as, by default index is discarded",
+			Usage: "Image name to keep index as, by default index is discarded",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "all-platforms",
-			Usage: "imports content for all platforms, false by default",
+			Usage: "Imports content for all platforms, false by default",
 		},
-		cli.BoolFlag{
+		&cli.StringFlag{
+			Name:  "platform",
+			Usage: "Imports content for specific platform",
+		},
+		&cli.BoolFlag{
 			Name:  "no-unpack",
-			Usage: "skip unpacking the images, false by default",
+			Usage: "Skip unpacking the images, cannot be used with --discard-unpacked-layers, false by default",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
+			Name:  "local",
+			Usage: "Run import locally rather than through transfer API",
+		},
+		&cli.BoolFlag{
 			Name:  "compress-blobs",
-			Usage: "compress uncompressed blobs when creating manifest (Docker format only)",
+			Usage: "Compress uncompressed blobs when creating manifest (Docker format only)",
 		},
-	}, commands.SnapshotterFlags...),
+		&cli.BoolFlag{
+			Name:  "discard-unpacked-layers",
+			Usage: "Allow the garbage collector to clean layers up from the content store after unpacking, cannot be used with --no-unpack, false by default",
+		},
+		&cli.BoolFlag{
+			Name:  "sync-fs",
+			Usage: "Synchronize the underlying filesystem containing files when unpack images, false by default",
+		},
+	}, append(commands.SnapshotterFlags, commands.LabelFlag)...),
 
-	Action: func(context *cli.Context) error {
+	Action: func(cliContext *cli.Context) error {
 		var (
-			in   = context.Args().First()
-			opts []containerd.ImportOpt
+			in              = cliContext.Args().First()
+			opts            []containerd.ImportOpt
+			platformMatcher platforms.MatchComparer
 		)
 
-		prefix := context.String("base-name")
+		client, ctx, cancel, err := commands.NewClient(cliContext)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+
+		if !cliContext.Bool("local") {
+			unsupportedFlags := []string{"discard-unpacked-layers"}
+			for _, s := range unsupportedFlags {
+				if cliContext.IsSet(s) {
+					return fmt.Errorf("\"--%s\" requires \"--local\" flag", s)
+				}
+			}
+			var opts []image.StoreOpt
+			prefix := cliContext.String("base-name")
+			var overwrite bool
+			if prefix == "" {
+				prefix = fmt.Sprintf("import-%s", time.Now().Format("2006-01-02"))
+				// Allow overwriting auto-generated prefix with named annotation
+				overwrite = true
+			}
+
+			labels := cliContext.StringSlice("label")
+			if len(labels) > 0 {
+				opts = append(opts, image.WithImageLabels(commands.LabelArgs(labels)))
+			}
+
+			if cliContext.Bool("digests") {
+				opts = append(opts, image.WithDigestRef(prefix, overwrite, !cliContext.Bool("skip-digest-for-named")))
+			} else {
+				opts = append(opts, image.WithNamedPrefix(prefix, overwrite))
+			}
+
+			// Even with --all-platforms, only the default platform layers are unpacked,
+			// for compatibility with --local.
+			//
+			// This is still not fully compatible with --local, which only unpacks
+			// the strict-default platform layers.
+			platUnpack := platforms.DefaultSpec()
+			if !cliContext.Bool("all-platforms") {
+				// If platform specified, use that one, if not use default
+				if platform := cliContext.String("platform"); platform != "" {
+					platUnpack, err = platforms.Parse(platform)
+					if err != nil {
+						return err
+					}
+				}
+				opts = append(opts, image.WithPlatforms(platUnpack))
+			}
+
+			if !cliContext.Bool("no-unpack") {
+				snapshotter := cliContext.String("snapshotter")
+				opts = append(opts, image.WithUnpack(platUnpack, snapshotter))
+			}
+
+			is := image.NewStore(cliContext.String("index-name"), opts...)
+
+			var iopts []tarchive.ImportOpt
+
+			if cliContext.Bool("compress-blobs") {
+				iopts = append(iopts, tarchive.WithForceCompression)
+			}
+
+			var r io.ReadCloser
+			if in == "-" {
+				r = os.Stdin
+			} else {
+				var err error
+				r, err = os.Open(in)
+				if err != nil {
+					return err
+				}
+			}
+			iis := tarchive.NewImageImportStream(r, "", iopts...)
+
+			pf, done := ProgressHandler(ctx, os.Stdout)
+			defer done()
+
+			err := client.Transfer(ctx, iis, is, transfer.WithProgress(pf))
+			closeErr := r.Close()
+			if err != nil {
+				return err
+			}
+
+			return closeErr
+		}
+
+		// Local logic
+
+		prefix := cliContext.String("base-name")
 		if prefix == "" {
 			prefix = fmt.Sprintf("import-%s", time.Now().Format("2006-01-02"))
 			opts = append(opts, containerd.WithImageRefTranslator(archive.AddRefPrefix(prefix)))
@@ -93,25 +210,52 @@ If foobar.tar contains an OCI ref named "latest" and anonymous ref "sha256:deadb
 			opts = append(opts, containerd.WithImageRefTranslator(archive.FilterRefPrefix(prefix)))
 		}
 
-		if context.Bool("digests") {
+		if cliContext.Bool("digests") {
 			opts = append(opts, containerd.WithDigestRef(archive.DigestTranslator(prefix)))
 		}
+		if cliContext.Bool("skip-digest-for-named") {
+			if !cliContext.Bool("digests") {
+				return errors.New("--skip-digest-for-named must be specified with --digests option")
+			}
+			opts = append(opts, containerd.WithSkipDigestRef(func(name string) bool { return name != "" }))
+		}
 
-		if idxName := context.String("index-name"); idxName != "" {
+		if idxName := cliContext.String("index-name"); idxName != "" {
 			opts = append(opts, containerd.WithIndexName(idxName))
 		}
 
-		if context.Bool("compress-blobs") {
+		if cliContext.Bool("compress-blobs") {
 			opts = append(opts, containerd.WithImportCompression())
 		}
 
-		opts = append(opts, containerd.WithAllPlatforms(context.Bool("all-platforms")))
+		if platform := cliContext.String("platform"); platform != "" {
+			platSpec, err := platforms.Parse(platform)
+			if err != nil {
+				return err
+			}
+			platformMatcher = platforms.OnlyStrict(platSpec)
+			opts = append(opts, containerd.WithImportPlatform(platformMatcher))
+		}
 
-		client, ctx, cancel, err := commands.NewClient(context)
+		opts = append(opts, containerd.WithAllPlatforms(cliContext.Bool("all-platforms")))
+
+		if cliContext.Bool("discard-unpacked-layers") {
+			if cliContext.Bool("no-unpack") {
+				return errors.New("--discard-unpacked-layers and --no-unpack are incompatible options")
+			}
+			opts = append(opts, containerd.WithDiscardUnpackedLayers())
+		}
+
+		labels := cliContext.StringSlice("label")
+		if len(labels) > 0 {
+			opts = append(opts, containerd.WithImageLabels(commands.LabelArgs(labels)))
+		}
+
+		ctx, done, err := client.WithLease(ctx)
 		if err != nil {
 			return err
 		}
-		defer cancel()
+		defer done(ctx)
 
 		var r io.ReadCloser
 		if in == "-" {
@@ -122,6 +266,7 @@ If foobar.tar contains an OCI ref named "latest" and anonymous ref "sha256:deadb
 				return err
 			}
 		}
+
 		imgs, err := client.Import(ctx, r, opts...)
 		closeErr := r.Close()
 		if err != nil {
@@ -131,16 +276,18 @@ If foobar.tar contains an OCI ref named "latest" and anonymous ref "sha256:deadb
 			return closeErr
 		}
 
-		if !context.Bool("no-unpack") {
+		if !cliContext.Bool("no-unpack") {
 			log.G(ctx).Debugf("unpacking %d images", len(imgs))
 
 			for _, img := range imgs {
-				// TODO: Allow configuration of the platform
-				image := containerd.NewImage(client, img)
+				if platformMatcher == nil { // if platform not specified use default.
+					platformMatcher = platforms.DefaultStrict()
+				}
+				image := containerd.NewImageWithPlatform(client, img, platformMatcher)
 
 				// TODO: Show unpack status
 				fmt.Printf("unpacking %s (%s)...", img.Name, img.Target.Digest)
-				err = image.Unpack(ctx, context.String("snapshotter"))
+				err = image.Unpack(ctx, cliContext.String("snapshotter"), containerd.WithUnpackApplyOpts(diff.WithSyncFs(cliContext.Bool("sync-fs"))))
 				if err != nil {
 					return err
 				}

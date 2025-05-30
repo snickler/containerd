@@ -17,37 +17,39 @@
 package content
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
-	"github.com/containerd/containerd/cmd/ctr/commands"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 	units "github.com/docker/go-units"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
 
 var (
 	// Command is the cli command for managing content
-	Command = cli.Command{
+	Command = &cli.Command{
 		Name:  "content",
-		Usage: "manage content",
+		Usage: "Manage content",
 		Subcommands: cli.Commands{
 			activeIngestCommand,
 			deleteCommand,
 			editCommand,
 			fetchCommand,
 			fetchObjectCommand,
+			fetchBlobCommand,
 			getCommand,
 			ingestCommand,
 			listCommand,
@@ -57,17 +59,17 @@ var (
 		},
 	}
 
-	getCommand = cli.Command{
+	getCommand = &cli.Command{
 		Name:        "get",
-		Usage:       "get the data for an object",
+		Usage:       "Get the data for an object",
 		ArgsUsage:   "[<digest>, ...]",
 		Description: "display the image object",
-		Action: func(context *cli.Context) error {
-			dgst, err := digest.Parse(context.Args().First())
+		Action: func(cliContext *cli.Context) error {
+			dgst, err := digest.Parse(cliContext.Args().First())
 			if err != nil {
 				return err
 			}
-			client, ctx, cancel, err := commands.NewClient(context)
+			client, ctx, cancel, err := commands.NewClient(cliContext)
 			if err != nil {
 				return err
 			}
@@ -86,26 +88,26 @@ var (
 		},
 	}
 
-	ingestCommand = cli.Command{
+	ingestCommand = &cli.Command{
 		Name:        "ingest",
-		Usage:       "accept content into the store",
+		Usage:       "Accept content into the store",
 		ArgsUsage:   "[flags] <key>",
 		Description: "ingest objects into the local content store",
 		Flags: []cli.Flag{
-			cli.Int64Flag{
+			&cli.Int64Flag{
 				Name:  "expected-size",
-				Usage: "validate against provided size",
+				Usage: "Validate against provided size",
 			},
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "expected-digest",
-				Usage: "verify content against expected digest",
+				Usage: "Verify content against expected digest",
 			},
 		},
-		Action: func(context *cli.Context) error {
+		Action: func(cliContext *cli.Context) error {
 			var (
-				ref            = context.Args().First()
-				expectedSize   = context.Int64("expected-size")
-				expectedDigest = digest.Digest(context.String("expected-digest"))
+				ref            = cliContext.Args().First()
+				expectedSize   = cliContext.Int64("expected-size")
+				expectedDigest = digest.Digest(cliContext.String("expected-digest"))
 			)
 			if err := expectedDigest.Validate(); expectedDigest != "" && err != nil {
 				return err
@@ -113,7 +115,7 @@ var (
 			if ref == "" {
 				return errors.New("must specify a transaction reference")
 			}
-			client, ctx, cancel, err := commands.NewClient(context)
+			client, ctx, cancel, err := commands.NewClient(cliContext)
 			if err != nil {
 				return err
 			}
@@ -128,26 +130,27 @@ var (
 		},
 	}
 
-	activeIngestCommand = cli.Command{
+	activeIngestCommand = &cli.Command{
 		Name:        "active",
-		Usage:       "display active transfers",
+		Usage:       "Display active transfers",
 		ArgsUsage:   "[flags] [<regexp>]",
 		Description: "display the ongoing transfers",
 		Flags: []cli.Flag{
-			cli.DurationFlag{
-				Name:   "timeout, t",
-				Usage:  "total timeout for fetch",
-				EnvVar: "CONTAINERD_FETCH_TIMEOUT",
+			&cli.DurationFlag{
+				Name:    "timeout",
+				Aliases: []string{"t"},
+				Usage:   "Total timeout for fetch",
+				EnvVars: []string{"CONTAINERD_FETCH_TIMEOUT"},
 			},
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "root",
-				Usage: "path to content store root",
+				Usage: "Path to content store root",
 				Value: "/tmp/content", // TODO(stevvooe): for now, just use the PWD/.content
 			},
 		},
-		Action: func(context *cli.Context) error {
-			match := context.Args().First()
-			client, ctx, cancel, err := commands.NewClient(context)
+		Action: func(cliContext *cli.Context) error {
+			match := cliContext.Args().First()
+			client, ctx, cancel, err := commands.NewClient(cliContext)
 			if err != nil {
 				return err
 			}
@@ -170,24 +173,25 @@ var (
 		},
 	}
 
-	listCommand = cli.Command{
+	listCommand = &cli.Command{
 		Name:        "list",
 		Aliases:     []string{"ls"},
-		Usage:       "list all blobs in the store",
+		Usage:       "List all blobs in the store",
 		ArgsUsage:   "[flags]",
 		Description: "list blobs in the content store",
 		Flags: []cli.Flag{
-			cli.BoolFlag{
-				Name:  "quiet, q",
-				Usage: "print only the blob digest",
+			&cli.BoolFlag{
+				Name:    "quiet",
+				Aliases: []string{"q"},
+				Usage:   "Print only the blob digest",
 			},
 		},
-		Action: func(context *cli.Context) error {
+		Action: func(cliContext *cli.Context) error {
 			var (
-				quiet = context.Bool("quiet")
-				args  = []string(context.Args())
+				quiet = cliContext.Bool("quiet")
+				args  = cliContext.Args().Slice()
 			)
-			client, ctx, cancel, err := commands.NewClient(context)
+			client, ctx, cancel, err := commands.NewClient(cliContext)
 			if err != nil {
 				return err
 			}
@@ -210,6 +214,7 @@ var (
 					for k, v := range info.Labels {
 						labelStrings = append(labelStrings, strings.Join([]string{k, v}, "="))
 					}
+					sort.Strings(labelStrings)
 					labels := strings.Join(labelStrings, ",")
 					if labels == "" {
 						labels = "-"
@@ -229,14 +234,14 @@ var (
 		},
 	}
 
-	setLabelsCommand = cli.Command{
+	setLabelsCommand = &cli.Command{
 		Name:        "label",
-		Usage:       "add labels to content",
+		Usage:       "Add labels to content",
 		ArgsUsage:   "<digest> [<label>=<value> ...]",
 		Description: "labels blobs in the content store",
-		Action: func(context *cli.Context) error {
-			object, labels := commands.ObjectWithLabelArgs(context)
-			client, ctx, cancel, err := commands.NewClient(context)
+		Action: func(cliContext *cli.Context) error {
+			object, labels := commands.ObjectWithLabelArgs(cliContext)
+			client, ctx, cancel, err := commands.NewClient(cliContext)
 			if err != nil {
 				return err
 			}
@@ -283,26 +288,26 @@ var (
 		},
 	}
 
-	editCommand = cli.Command{
+	editCommand = &cli.Command{
 		Name:        "edit",
-		Usage:       "edit a blob and return a new digest",
+		Usage:       "Edit a blob and return a new digest",
 		ArgsUsage:   "[flags] <digest>",
 		Description: "edit a blob and return a new digest",
 		Flags: []cli.Flag{
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "validate",
-				Usage: "validate the result against a format (json, mediatype, etc.)",
+				Usage: "Validate the result against a format (json, mediatype, etc.)",
 			},
-			cli.StringFlag{
-				Name:   "editor",
-				Usage:  "select editor (vim, emacs, etc.)",
-				EnvVar: "EDITOR",
+			&cli.StringFlag{
+				Name:    "editor",
+				Usage:   "Select editor (vim, emacs, etc.)",
+				EnvVars: []string{"EDITOR"},
 			},
 		},
-		Action: func(context *cli.Context) error {
+		Action: func(cliContext *cli.Context) error {
 			var (
-				validate = context.String("validate")
-				object   = context.Args().First()
+				validate = cliContext.String("validate")
+				object   = cliContext.Args().First()
 			)
 
 			if validate != "" {
@@ -316,7 +321,7 @@ var (
 			if err != nil {
 				return err
 			}
-			client, ctx, cancel, err := commands.NewClient(context)
+			client, ctx, cancel, err := commands.NewClient(cliContext)
 			if err != nil {
 				return err
 			}
@@ -328,7 +333,7 @@ var (
 			}
 			defer ra.Close()
 
-			nrc, err := edit(context, content.NewReader(ra))
+			nrc, err := edit(cliContext, content.NewReader(ra))
 			if err != nil {
 				return err
 			}
@@ -352,19 +357,19 @@ var (
 		},
 	}
 
-	deleteCommand = cli.Command{
+	deleteCommand = &cli.Command{
 		Name:      "delete",
 		Aliases:   []string{"del", "remove", "rm"},
-		Usage:     "permanently delete one or more blobs",
+		Usage:     "Permanently delete one or more blobs",
 		ArgsUsage: "[<digest>, ...]",
 		Description: `Delete one or more blobs permanently. Successfully deleted
 	blobs are printed to stdout.`,
-		Action: func(context *cli.Context) error {
+		Action: func(cliContext *cli.Context) error {
 			var (
-				args      = []string(context.Args())
+				args      = cliContext.Args().Slice()
 				exitError error
 			)
-			client, ctx, cancel, err := commands.NewClient(context)
+			client, ctx, cancel, err := commands.NewClient(cliContext)
 			if err != nil {
 				return err
 			}
@@ -401,27 +406,27 @@ var (
 	// TODO(stevvooe): Create "multi-fetch" mode that just takes a remote
 	// then receives object/hint lines on stdin, returning content as
 	// needed.
-	fetchObjectCommand = cli.Command{
+	fetchObjectCommand = &cli.Command{
 		Name:        "fetch-object",
-		Usage:       "retrieve objects from a remote",
+		Usage:       "Retrieve objects from a remote",
 		ArgsUsage:   "[flags] <remote> <object> [<hint>, ...]",
 		Description: `Fetch objects by identifier from a remote.`,
 		Flags:       commands.RegistryFlags,
-		Action: func(context *cli.Context) error {
+		Action: func(cliContext *cli.Context) error {
 			var (
-				ref = context.Args().First()
+				ref = cliContext.Args().First()
 			)
-			ctx, cancel := commands.AppContext(context)
+			ctx, cancel := commands.AppContext(cliContext)
 			defer cancel()
 
-			resolver, err := commands.GetResolver(ctx, context)
+			resolver, err := commands.GetResolver(ctx, cliContext)
 			if err != nil {
 				return err
 			}
 
 			ctx = log.WithLogger(ctx, log.G(ctx).WithField("ref", ref))
 
-			log.G(ctx).Debugf("resolving")
+			log.G(ctx).Tracef("resolving")
 			name, desc, err := resolver.Resolve(ctx, ref)
 			if err != nil {
 				return err
@@ -431,7 +436,7 @@ var (
 				return err
 			}
 
-			log.G(ctx).Debugf("fetching")
+			log.G(ctx).Tracef("fetching")
 			rc, err := fetcher.Fetch(ctx, desc)
 			if err != nil {
 				return err
@@ -443,36 +448,96 @@ var (
 		},
 	}
 
-	pushObjectCommand = cli.Command{
-		Name:        "push-object",
-		Usage:       "push an object to a remote",
-		ArgsUsage:   "[flags] <remote> <object> <type>",
-		Description: `Push objects by identifier to a remote.`,
-		Flags:       commands.RegistryFlags,
-		Action: func(context *cli.Context) error {
+	fetchBlobCommand = &cli.Command{
+		Name:        "fetch-blob",
+		Usage:       "Retrieve blobs from a remote",
+		ArgsUsage:   "[flags] <remote> [<digest>, ...]",
+		Description: `Fetch blobs by digests from a remote.`,
+		Flags: append(commands.RegistryFlags, []cli.Flag{
+			&cli.StringFlag{
+				Name:  "media-type",
+				Usage: "Specify target mediatype for request header",
+			},
+		}...),
+		Action: func(cliContext *cli.Context) error {
 			var (
-				ref    = context.Args().Get(0)
-				object = context.Args().Get(1)
-				media  = context.Args().Get(2)
+				ref     = cliContext.Args().First()
+				digests = cliContext.Args().Tail()
 			)
-			dgst, err := digest.Parse(object)
-			if err != nil {
-				return err
+			if len(digests) == 0 {
+				return errors.New("must specify digests")
 			}
-			client, ctx, cancel, err := commands.NewClient(context)
-			if err != nil {
-				return err
-			}
+			ctx, cancel := commands.AppContext(cliContext)
 			defer cancel()
 
-			resolver, err := commands.GetResolver(ctx, context)
+			resolver, err := commands.GetResolver(ctx, cliContext)
 			if err != nil {
 				return err
 			}
 
 			ctx = log.WithLogger(ctx, log.G(ctx).WithField("ref", ref))
 
-			log.G(ctx).Debugf("resolving")
+			log.G(ctx).Tracef("resolving")
+			fetcher, err := resolver.Fetcher(ctx, ref)
+			if err != nil {
+				return err
+			}
+
+			fetcherByDigest, ok := fetcher.(remotes.FetcherByDigest)
+			if !ok {
+				return fmt.Errorf("fetcher %T does not implement remotes.FetcherByDigest", fetcher)
+			}
+
+			for _, f := range digests {
+				dgst, err := digest.Parse(f)
+				if err != nil {
+					return err
+				}
+				rc, desc, err := fetcherByDigest.FetchByDigest(ctx, dgst, remotes.WithMediaType(cliContext.String("media-type")))
+				if err != nil {
+					return err
+				}
+				log.G(ctx).Debugf("desc=%+v", desc)
+				_, err = io.Copy(os.Stdout, rc)
+				rc.Close()
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+
+	pushObjectCommand = &cli.Command{
+		Name:        "push-object",
+		Usage:       "Push an object to a remote",
+		ArgsUsage:   "[flags] <remote> <object> <type>",
+		Description: `Push objects by identifier to a remote.`,
+		Flags:       commands.RegistryFlags,
+		Action: func(cliContext *cli.Context) error {
+			var (
+				ref    = cliContext.Args().Get(0)
+				object = cliContext.Args().Get(1)
+				media  = cliContext.Args().Get(2)
+			)
+			dgst, err := digest.Parse(object)
+			if err != nil {
+				return err
+			}
+			client, ctx, cancel, err := commands.NewClient(cliContext)
+			if err != nil {
+				return err
+			}
+			defer cancel()
+
+			resolver, err := commands.GetResolver(ctx, cliContext)
+			if err != nil {
+				return err
+			}
+
+			ctx = log.WithLogger(ctx, log.G(ctx).WithField("ref", ref))
+
+			log.G(ctx).Tracef("resolving")
 			pusher, err := resolver.Pusher(ctx, ref)
 			if err != nil {
 				return err
@@ -513,19 +578,25 @@ var (
 	}
 )
 
-func edit(context *cli.Context, rd io.Reader) (io.ReadCloser, error) {
-	editor := context.String("editor")
+func edit(cliContext *cli.Context, rd io.Reader) (_ io.ReadCloser, retErr error) {
+	editor := cliContext.String("editor")
 	if editor == "" {
-		return nil, fmt.Errorf("editor is required")
+		return nil, errors.New("editor is required")
 	}
 
-	tmp, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), "edit-")
+	tmp, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), "edit-")
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := io.Copy(tmp, rd); err != nil {
-		tmp.Close()
+	defer func() {
+		if retErr != nil {
+			os.Remove(tmp.Name())
+		}
+	}()
+	_, err = io.Copy(tmp, rd)
+	tmp.Close()
+	if err != nil {
 		return nil, err
 	}
 
@@ -537,17 +608,15 @@ func edit(context *cli.Context, rd io.Reader) (io.ReadCloser, error) {
 	cmd.Env = os.Environ()
 
 	if err := cmd.Run(); err != nil {
-		tmp.Close()
 		return nil, err
 	}
-
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		tmp.Close()
+	// The editor might recreate new file and override the original one. We should reopen the file
+	edited, err := os.OpenFile(tmp.Name(), os.O_RDONLY, 0600)
+	if err != nil {
 		return nil, err
 	}
-
-	return onCloser{ReadCloser: tmp, onClose: func() error {
-		return os.RemoveAll(tmp.Name())
+	return onCloser{ReadCloser: edited, onClose: func() error {
+		return os.RemoveAll(edited.Name())
 	}}, nil
 }
 

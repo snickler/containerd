@@ -17,7 +17,6 @@
 package integration
 
 import (
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,21 +25,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/integration/images"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 func TestPodDualStack(t *testing.T) {
-	testPodLogDir, err := ioutil.TempDir("/tmp", "dualstack")
-	require.NoError(t, err)
-	defer os.RemoveAll(testPodLogDir)
+	testPodLogDir := t.TempDir()
 
 	t.Log("Create a sandbox")
 	sb, sbConfig := PodSandboxConfigWithCleanup(t, "sandbox", "dualstack", WithPodLogDirectory(testPodLogDir))
 
 	var (
-		testImage     = GetImage(BusyBox)
+		testImage     = images.Get(images.BusyBox)
 		containerName = "test-container"
 	)
 
@@ -77,7 +75,7 @@ func TestPodDualStack(t *testing.T) {
 		return false, nil
 	}, time.Second, 30*time.Second))
 
-	content, err := ioutil.ReadFile(filepath.Join(testPodLogDir, containerName))
+	content, err := os.ReadFile(filepath.Join(testPodLogDir, containerName))
 	assert.NoError(t, err)
 	status, err := runtimeService.PodSandboxStatus(sb)
 	require.NoError(t, err)

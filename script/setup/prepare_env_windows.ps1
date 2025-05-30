@@ -1,18 +1,23 @@
 # Prepare windows environment for building and running containerd tests
 
-$PACKAGES= @{ mingw = ""; git = ""; golang = "1.16.6"; make = "" }
+# Disable Windows Defender real time monitoring. Real time monitoring consumes a lot of
+# CPU and slows down tests as images are unarchived, and is not really needed in a short
+# lived test environment.
+Set-MpPreference -DisableRealtimeMonitoring:$true
 
-write-host "Downloading chocolatey package"
+$PACKAGES= @{ mingw = "10.2.0"; git = ""; golang = "1.24.3"; make = ""; nssm = "" }
+
+Write-Host "Downloading chocolatey package"
 curl.exe -L "https://packages.chocolatey.org/chocolatey.0.10.15.nupkg" -o 'c:\choco.zip'
 Expand-Archive "c:\choco.zip" -DestinationPath "c:\choco"
 
-write-host "Installing choco"
+Write-Host "Installing choco"
 & "c:\choco\tools\chocolateyInstall.ps1"
 
-write-host "Set choco.exe path."
+Write-Host "Set choco.exe path."
 $env:PATH+=";C:\ProgramData\chocolatey\bin"
 
-write-host "Install necessary packages"
+Write-Host "Install necessary packages"
 
 foreach ($package in $PACKAGES.Keys) {
     $command = "choco.exe install $package --yes"
@@ -23,23 +28,28 @@ foreach ($package in $PACKAGES.Keys) {
     Invoke-Expression $command
 }
 
-write-host "Set up environment."
+Write-Host "Set up environment."
 
-$path = ";c:\Program Files\Git\bin;c:\Program Files\Go\bin;c:\Users\azureuser\go\bin;c:\containerd\bin"
+$userGoBin = "${env:HOME}\go\bin"
+$path = ";c:\Program Files\Git\bin;c:\Program Files\Go\bin;${userGoBin};c:\containerd\bin"
 $env:PATH+=$path
 
-write-host $env:PATH
+Write-Host $env:PATH
 
 [Environment]::SetEnvironmentVariable("PATH", $env:PATH, 'User')
 
 # Prepare Log dir
 mkdir c:\Logs
 
+# Log go env for future reference:
+go env > c:\Logs\go-env.txt
+cat c:\Logs\go-env.txt
+
 # Pull junit conversion tool
-go get -u github.com/jstemmer/go-junit-report
+go install github.com/jstemmer/go-junit-report@v0.9.1
 
 # Get critctl tool. Used for cri-integration tests
-$CRICTL_DOWNLOAD_URL="https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.21.0/crictl-v1.21.0-windows-amd64.tar.gz"
+$CRICTL_DOWNLOAD_URL="https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.26.0/crictl-v1.26.0-windows-amd64.tar.gz"
 curl.exe -L $CRICTL_DOWNLOAD_URL -o c:\crictl.tar.gz
 tar -xvf c:\crictl.tar.gz
-mv crictl.exe c:\Users\azureuser\go\bin\crictl.exe # Move crictl somewhere in path
+mv crictl.exe "${userGoBin}\crictl.exe" # Move crictl somewhere in path

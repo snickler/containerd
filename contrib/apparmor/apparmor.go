@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
    Copyright The containerd Authors.
@@ -21,13 +21,12 @@ package apparmor
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"fmt"
 	"os"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 )
 
 // WithProfile sets the provided apparmor profile to the spec
@@ -64,7 +63,7 @@ func LoadDefaultProfile(name string) error {
 	if err != nil {
 		return err
 	}
-	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.Name)
+	f, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), p.Name)
 	if err != nil {
 		return err
 	}
@@ -76,7 +75,7 @@ func LoadDefaultProfile(name string) error {
 		return err
 	}
 	if err := load(path); err != nil {
-		return errors.Wrapf(err, "load apparmor profile %s", path)
+		return fmt.Errorf("load apparmor profile %s: %w", path, err)
 	}
 	return nil
 }

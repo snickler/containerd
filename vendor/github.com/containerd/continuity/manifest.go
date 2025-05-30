@@ -19,12 +19,12 @@ package continuity
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"sort"
 
 	pb "github.com/containerd/continuity/proto"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
 )
 
 // Manifest provides the contents of a manifest. Users of this struct should
@@ -56,8 +56,8 @@ func Unmarshal(p []byte) (*Manifest, error) {
 
 func Marshal(m *Manifest) ([]byte, error) {
 	var bm pb.Manifest
-	for _, resource := range m.Resources {
-		bm.Resource = append(bm.Resource, toProto(resource))
+	for _, rsrc := range m.Resources {
+		bm.Resource = append(bm.Resource, toProto(rsrc))
 	}
 
 	return proto.Marshal(&bm)
@@ -65,21 +65,26 @@ func Marshal(m *Manifest) ([]byte, error) {
 
 func MarshalText(w io.Writer, m *Manifest) error {
 	var bm pb.Manifest
-	for _, resource := range m.Resources {
-		bm.Resource = append(bm.Resource, toProto(resource))
+	for _, rsrc := range m.Resources {
+		bm.Resource = append(bm.Resource, toProto(rsrc))
 	}
 
-	return proto.MarshalText(w, &bm)
+	b, err := prototext.Marshal(&bm)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(b)
+	return err
 }
 
 // BuildManifest creates the manifest for the given context
-func BuildManifest(ctx Context) (*Manifest, error) {
+func BuildManifest(fsContext Context) (*Manifest, error) {
 	resourcesByPath := map[string]Resource{}
-	hardlinks := newHardlinkManager()
+	hardLinks := newHardlinkManager()
 
-	if err := ctx.Walk(func(p string, fi os.FileInfo, err error) error {
+	if err := fsContext.Walk(func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
-			return fmt.Errorf("error walking %s: %v", p, err)
+			return fmt.Errorf("error walking %s: %w", p, err)
 		}
 
 		if p == string(os.PathSeparator) {
@@ -87,26 +92,25 @@ func BuildManifest(ctx Context) (*Manifest, error) {
 			return nil
 		}
 
-		resource, err := ctx.Resource(p, fi)
+		rsrc, err := fsContext.Resource(p, fi)
 		if err != nil {
 			if err == ErrNotFound {
 				return nil
 			}
-			log.Printf("error getting resource %q: %v", p, err)
-			return err
+			return fmt.Errorf("failed to get resource %q: %w", p, err)
 		}
 
 		// add to the hardlink manager
-		if err := hardlinks.Add(fi, resource); err == nil {
+		if err := hardLinks.Add(fi, rsrc); err == nil {
 			// Resource has been accepted by hardlink manager so we don't add
 			// it to the resourcesByPath until we merge at the end.
 			return nil
 		} else if err != errNotAHardLink {
 			// handle any other case where we have a proper error.
-			return fmt.Errorf("adding hardlink %s: %v", p, err)
+			return fmt.Errorf("adding hardlink %s: %w", p, err)
 		}
 
-		resourcesByPath[p] = resource
+		resourcesByPath[p] = rsrc
 
 		return nil
 	}); err != nil {
@@ -114,20 +118,18 @@ func BuildManifest(ctx Context) (*Manifest, error) {
 	}
 
 	// merge and post-process the hardlinks.
-	// nolint:misspell
-	hardlinked, err := hardlinks.Merge()
+	hardLinked, err := hardLinks.Merge()
 	if err != nil {
 		return nil, err
 	}
 
-	// nolint:misspell
-	for _, resource := range hardlinked {
-		resourcesByPath[resource.Path()] = resource
+	for _, rsrc := range hardLinked {
+		resourcesByPath[rsrc.Path()] = rsrc
 	}
 
 	var resources []Resource
-	for _, resource := range resourcesByPath {
-		resources = append(resources, resource)
+	for _, rsrc := range resourcesByPath {
+		resources = append(resources, rsrc)
 	}
 
 	sort.Stable(ByPath(resources))
@@ -139,9 +141,9 @@ func BuildManifest(ctx Context) (*Manifest, error) {
 
 // VerifyManifest verifies all the resources in a manifest
 // against files from the given context.
-func VerifyManifest(ctx Context, manifest *Manifest) error {
-	for _, resource := range manifest.Resources {
-		if err := ctx.Verify(resource); err != nil {
+func VerifyManifest(fsContext Context, manifest *Manifest) error {
+	for _, rsrc := range manifest.Resources {
+		if err := fsContext.Verify(rsrc); err != nil {
 			return err
 		}
 	}
@@ -151,9 +153,9 @@ func VerifyManifest(ctx Context, manifest *Manifest) error {
 
 // ApplyManifest applies on the resources in a manifest to
 // the given context.
-func ApplyManifest(ctx Context, manifest *Manifest) error {
-	for _, resource := range manifest.Resources {
-		if err := ctx.Apply(resource); err != nil {
+func ApplyManifest(fsContext Context, manifest *Manifest) error {
+	for _, rsrc := range manifest.Resources {
+		if err := fsContext.Apply(rsrc); err != nil {
 			return err
 		}
 	}

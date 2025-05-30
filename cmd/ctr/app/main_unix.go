@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
    Copyright The containerd Authors.
@@ -18,7 +18,7 @@
 
 package app
 
-import "github.com/containerd/containerd/cmd/ctr/commands/shim"
+import "github.com/containerd/containerd/v2/cmd/ctr/commands/shim"
 
 func init() {
 	extraCmds = append(extraCmds, shim.Command)

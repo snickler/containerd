@@ -19,19 +19,36 @@ USAGE:
    containerd [global options] command [command options] [arguments...]
 
 VERSION:
-   v1.0.0-alpha3-36-ge9b86af
+   v2.0.0-beta.0
+
+DESCRIPTION:
+
+containerd is a high performance container runtime whose daemon can be started
+by using this command. If none of the *config*, *publish*, *oci-hook*, or *help* commands
+are specified, the default action of the **containerd** command is to start the
+containerd daemon in the foreground.
+
+
+A default configuration is used if no TOML configuration is specified or located
+at the default file location. The *containerd config* command can be used to
+generate the default configuration for containerd. The output of that command
+can be used and modified as necessary as a custom configuration.
 
 COMMANDS:
-     config   information on the containerd config
-     help, h  Shows a list of commands or help for one command
+   config    Information on the containerd config
+   publish   Binary to publish events to containerd
+   oci-hook  Provides a base for OCI runtime hooks to allow arguments to be injected.
+   help, h   Shows a list of commands or help for one command
 
 GLOBAL OPTIONS:
-   --config value, -c value     path to the configuration file (default: "/etc/containerd/config.toml")
-   --log-level value, -l value  set the logging level [debug, info, warn, error, fatal, panic]
-   --address value, -a value    address for containerd's GRPC server
+   --config value, -c value     Path to the configuration file (default: "/etc/containerd/config.toml")
+   --log-level value, -l value  Set the logging level [trace, debug, info, warn, error, fatal, panic]
+   --address value, -a value    Address for containerd's GRPC server
    --root value                 containerd root directory
-   --help, -h                   show help
-   --version, -v                print the version
+   --state value                containerd state directory
+   --help, -h                   Show help
+   --version, -v                Print the version
+
 ```
 
 While a few daemon level options can be set from CLI flags the majority of containerd's configuration is kept in the configuration file.
@@ -102,7 +119,7 @@ containerd itself does not actually have any persistent data that it needs to st
 │   └── ingest
 ├── io.containerd.metadata.v1.bolt
 │   └── meta.db
-├── io.containerd.runtime.v1.linux
+├── io.containerd.runtime.v2.task
 │   ├── default
 │   └── example
 ├── io.containerd.snapshotter.v1.btrfs
@@ -118,7 +135,7 @@ Sockets, pids, runtime state, mount points, and other plugin data that must not 
 /run/containerd
 ├── containerd.sock
 ├── debug.sock
-├── io.containerd.runtime.v1.linux
+├── io.containerd.runtime.v2.task
 │   └── default
 │       └── redis
 │           ├── config.json
@@ -154,6 +171,8 @@ They should not be tampered with as corruption and bugs can and will happen.
 External apps reading or watching changes in these directories have been known to cause `EBUSY` and stale file handles when containerd and/or its plugins try to cleanup resources.
 
 ```toml
+version = 2
+
 # persistent data location
 root = "/var/lib/containerd"
 # runtime state information
@@ -198,23 +217,6 @@ You will have to read the plugin specific docs to find the options that your plu
 
 See [containerd's Plugin documentation](./PLUGINS.md)
 
-### Linux Runtime Plugin
-
-The linux runtime allows a few options to be set to configure the shim and the runtime that you are using.
-
-```toml
-[plugins.linux]
-	# shim binary name/path
-	shim = ""
-	# runtime binary name/path
-	runtime = "runc"
-	# do not use a shim when starting containers, saves on memory but
-	# live restore is not supported
-	no_shim = false
-	# display shim logs in the containerd daemon's log output
-	shim_debug = true
-```
-
 ### Bolt Metadata Plugin
 
 The bolt metadata plugin allows configuration of the content sharing policy between namespaces.
@@ -229,6 +231,12 @@ Both modes share backing data, while "shared" will reduce total bandwidth across
 The default is "shared". While this is largely the most desired policy, one can change to "isolated" mode with the following configuration:
 
 ```toml
-[plugins.bolt]
+version = 2
+
+[plugins."io.containerd.metadata.v1.bolt"]
 	content_sharing_policy = "isolated"
 ```
+
+In "isolated" mode, it is also possible to share only the contents of a specific namespace by adding the label `containerd.io/namespace.shareable=true` to that namespace.
+This will make its blobs available in all other namespaces even if the content sharing policy is set to "isolated".
+If the label value is set to anything other than `true`, the namespace content will not be shared.
